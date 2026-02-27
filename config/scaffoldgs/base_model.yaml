@@ -1,104 +1,200 @@
-# Model Parameters
+# =============================================================================
+# Scaffold-GS 基线模型配置 (无LOD, 单尺度体素)
+# 对应模型类: scene/gs_model_scaffoldgs/base_model.py → GaussianModel
+# =============================================================================
+
+# 模型参数:model_params
 model_params: {
     model_config: {
-        name: "GaussianModel",
+        name: "GaussianModel",         # 使用基础ScaffoldGS模型(无八叉树LOD)
         kwargs: {
-            feat_dim: 32, 
-            view_dim: 3,
-            padding: 0.0,
-            appearance_dim: 0,
-            n_offsets: 10, 
-            voxel_size: 0.001,
-            update_depth: 3, 
-            update_init_factor: 16,
-            update_hierachy_factor: 4,
-            use_feat_bank: False,
+            feat_dim: 32,              # anchor特征维度
+            view_dim: 3,               # 视角方向维度(3D单位向量)
+            padding: 0.0,              # 体素网格填充偏移
+            appearance_dim: 0,         # 外观嵌入维度(0=关闭, >0启用阶段五)
+            n_offsets: 10,             # 每个anchor生成的高斯个数
+
+            # ============================================================
+            # ▼ Scaffold-GS 独有: 多分辨率体素用于致密化(anchor_growing) ▼
+            #  多分辨率的Voxel Grid用于控制在哪个尺度放Anchor点,粗尺度anchor点的Gaussian活动范围大,细尺度的anchor中Gaussian活动范围小
+            #
+            # 【工作原理】致密化时遍历 update_depth 层, 每层用不同大小的Voxel Grid:
+            #   层0: cur_size = voxel_size × 16  = 0.016 (粗Voxel, 梯度阈值×1)
+            #   层1: cur_size = voxel_size × 4   = 0.004 (中Voxel, 梯度阈值×2)
+            #   层2: cur_size = voxel_size × 1   = 0.001 (细Voxel, 梯度阈值×4)
+            #   公式: size_factor = update_init_factor / (update_hierachy_factor ^ i)
+            #
+            # 【新anchor的scaling初始化】
+            #   新anchor的 _scaling 直接设为所在层的 cur_size(仅仅在初始化,粗Voxel的anchor的Gaussian范围初始为0.016,细Voxel的anchor的Gaussian范围初始为0.004)
+            #       但是_scaling 自由优化,没有任何约束保证粗层 anchor 的 scaling 始终 > 细层 anchor 的 scaling,多分辨率体素用完即弃
+            #   - _scaling前3维 → 控制偏移范围(高斯中心可偏离anchor多远)
+            #   - _scaling后3维 → 控制高斯椭球体大小
+            #   初始化时: 粗Voxel的anchor → 生成范围大的高斯; 细Voxel → 生成范围小的高斯
+            #   但 _scaling 是可学习参数, 训练中会被优化覆盖, 仅提供更好的初始化
+            #
+            # 【与 Octree-GS 的关键区别】
+            #   - 新anchor没有 _level 属性, 与旧anchor混在一起, 无LOD概念,不同层级的anchor没有区分,_scaling自由优化
+            #   - 渲染时所有anchor都参与, 没有 set_anchor_mask() 距离筛选
+            #   - 多分辨率网格只在致密化阶段使用, 训练结束后无意义,没有从结构上保证多尺度层次
+            #   - 而 Octree-GS 的 _level 是固定标签, 贯穿初始化→训练→推理全流程
+            # ============================================================
+            voxel_size: 0.001,          # 基础体素大小(最细层), 全场景统一尺度
+            update_depth: 3,            # 致密化遍历的层数(0/1/2三层, 从粗到细)
+            update_init_factor: 16,     # 最粗层的体素倍率(最粗 = voxel_size × 16)
+            update_hierachy_factor: 4,  # 相邻层体素缩放比(16→4→1, 每层缩小4倍)
+            # ============================================================
+            
+            use_feat_bank: False,       # 是否使用多分辨率特征库(feature bank)
         }
     },
-    base_model: "scaffoldgs",
-    source_path: "/nas/shared/pjlab_lingjun_landmarks/pjlab_lingjun_landmarks_hdd/yumulin_group/landmark_data/L1_indoor_1208/5f/eval_colmap",
-    dataset_name: "demo",
-    scene_name: "5f", 
-    images: "images",
-    resolution: -1,
+    base_model: "scaffoldgs",          # 渲染model: scaffoldgs
+    dataset_name: "mipnerf360",        # 数据集名称
+    source_path: "./data/bicycle",     # 数据集路径(scene文件夹含images sparse)
+    scene_name: "Bicycle",             # 3D重建场景名称
+    images: "images",                  # 图像文件夹名称
+    resolution: -1,                     # -1=使用原始分辨率(Mipnerf提供不同分辨率的图像images-X)
     white_background: False,
     random_background: False,
-    resolution_scales: [1.0],
-    data_device: "cpu",
-    eval: True,
-    ratio: 1,
-    render_mode: "RGB",
+    resolution_scales: [1.0],           # 多分辨率训练(1.0=仅原始分辨率)
+    data_device: "cuda",
+    eval: True,                         # 是否划分训练/测试集
+    ratio: 1,                           # 点云下采样比例(1=不下采样,使用Colmap中所有的SFM点云)
+    render_mode: "RGB",                 # 渲染模式: "RGB" 或 "RGB+ED"(含深度)
 }
 
-# Pipeline Parameters
+# Pipeline参数      
 pipeline_params: {
     compute_cov3D_python:  False,
     debug:  False
 }
 
-# Optimization Parameters
+# 优化参数
 optim_params: {
-    iterations: 40_000,
+    iterations: 40_000,                 # 总训练迭代次数
+
+    # --- 锚点位置学习率(Scaffold-GS中锚点位置不学习, lr=0) => Scaffold-GS的锚点位置是固定的,在该层Voxel中心 ---
     position_lr_init: 0.0,
     position_lr_final: 0.0,
     position_lr_delay_mult: 0.01,
     position_lr_max_steps: 40_000,
     
+    # --- 偏移量学习率(每个锚点的k个高斯偏移,可学习)
     offset_lr_init: 0.01,
     offset_lr_final: 0.0001,
     offset_lr_delay_mult: 0.01,
     offset_lr_max_steps: 40_000,
 
-    feature_lr: 0.0075,
-    scaling_lr: 0.007,
-    rotation_lr: 0.002,
+    # --- 其他可学习参数(anchor级别的优化参数) ---
+    # ============================================================
+    # 【Anchor 拥有的属性 (锚点级, N个anchor)】
+    #   _anchor      [N, 3]     位置固定,处于对应层级的Voxel中心
+    #   _scaling     [N, 6]     前3维=偏移范围(限制Gaussian位置偏移), 后3维=anchor管辖的高斯大小上界
+    #   _rotation    [N, 4]     锚点朝向, 用于prefilter_voxel视锥投影
+    #   _anchor_feat [N, 32]    锚点特征, MLP输入,去预测Gaussian的属性(不透明度/协方差/颜色),GS的偏移不是由MLP预测,而是Anchor直接优化
+    #   _offset      [N, k, 3]  Anchor周围管辖的Gaussian数量,k=10个高斯的位置相对与anchor位置偏移量
+    #
+    # 【每个 Anchor 生成 k=10 个高斯, 属性来源】
+    #   高斯位置    = _anchor + _offset × _scaling[:3]       ← anchor级,不是MLP学习的
+    #   高斯大小    = _scaling[3:] × sigmoid(mlp_cov输出)    ← anchor级 × MLP
+    #   高斯旋转    = normalize(mlp_cov输出[3:7])            ← 纯MLP, 不是_rotation! Gaussian的大小和旋转由MLP预测(协方差矩阵COV控制大小+旋转)
+    #   高斯颜色    = mlp_color(feat, view_dir)              ← 纯MLP
+    #   高斯不透明度 = mlp_opacity(feat, view_dir)            ← 纯MLP
+    #
+    # 【各参数的级别/维度/作用】
+    #   参数          级别      维度     作用
+    #   _scaling      锚点级    [N,6]    anchor管辖的高斯偏移范围 + 高斯大小上界（共享给k个高斯）
+    #   _rotation     锚点级    [N,4]    视锥剔除时的锚点投影朝向
+    #   mlp_cov输出    高斯级    [N*k,7]  前3维=高斯精细缩放 三维缩放向量, 后4维=高斯旋转(每个高斯独立) 旋转四元数
+    # ============================================================
+    feature_lr: 0.0075,                # 锚点特征(_anchor_feat)学习率
+    scaling_lr: 0.007,                 # 锚点缩放(_scaling)学习率
+    rotation_lr: 0.002,                # 锚点旋转(_rotation)学习率
     
+    # --- MLP学习率(不透明度/协方差/颜色) ---
+    # ============================================================
+    # 【三个核心MLP的共享输入】
+    #   cat_local_view = _anchor_feat[32] + ob_view[3] = 35维
+    #     - _anchor_feat: 锚点可学习特征, 编码局部几何/外观
+    #     - ob_view:      anchor→camera 的单位方向向量(视角依赖性)
+    #   注: ob_dist(距离)在base Scaffold-GS中不作为MLP输入
+    # ============================================================
+
+    # mlp_opacity: 输入 cat_local_view[35] → 输出 [N, k] 每个高斯的不透明度
     mlp_opacity_lr_init: 0.002,
     mlp_opacity_lr_final: 0.00002,  
     mlp_opacity_lr_delay_mult: 0.01,
     mlp_opacity_lr_max_steps: 40_000,
 
+    # mlp_cov: 输入 cat_local_view[35] → 输出 [N, k*7] 缩放(3)+旋转四元数(4)
     mlp_cov_lr_init: 0.004,
     mlp_cov_lr_final: 0.004,
     mlp_cov_lr_delay_mult: 0.01,
     mlp_cov_lr_max_steps: 40_000,
     
+    # mlp_color: 输入 cat_local_view[35] → 输出 [N, k*3] 每个高斯的RGB
+    #   ※ 当 appearance_dim>0 时, 输入变为 cat_local_view[35] + appearance[app_dim]
+    #     外观嵌入仅影响颜色MLP(不影响opacity和cov), 因为几何不应随光照变化
     mlp_color_lr_init: 0.008,
     mlp_color_lr_final: 0.00005,
     mlp_color_lr_delay_mult: 0.01,
     mlp_color_lr_max_steps: 40_000,
 
-    mlp_color_lr_init: 0.008,
+    mlp_color_lr_init: 0.008,          # 注意: 此处重复定义了mlp_color, 后者会覆盖前者
     mlp_color_lr_final: 0.00005,
     mlp_color_lr_delay_mult: 0.01,
     mlp_color_lr_max_steps: 40_000,
     
+    # ============================================================
+    # 【可选模块(开关控制)】
+    # ============================================================
+
+    # mlp_featurebank: 开关 use_feat_bank=True
+    #   输入 ob_view[3] → 输出权重[3], 对 _anchor_feat 做多分辨率加权混合
+    #   效果: 不同视角看到不同分辨率的特征, 间接影响所有三个MLP的输入
+    #   注意: 不是直接拼接到MLP输入, 而是改变了 _anchor_feat 本身
     mlp_featurebank_lr_init: 0.01,
     mlp_featurebank_lr_final: 0.00001,
     mlp_featurebank_lr_delay_mult: 0.01,
     mlp_featurebank_lr_max_steps: 40_000,
 
+    # appearance embedding: 开关 appearance_dim>0
+    #   为每张训练图像分配一个可学习隐向量 [app_dim维]
+    #   仅拼接到 mlp_color 的输入中, 解决大场景光照/曝光不一致问题
     appearance_lr_init: 0.05,
     appearance_lr_final: 0.0005,
     appearance_lr_delay_mult: 0.01,
     appearance_lr_max_steps: 40_000,
 
-    lambda_dssim: 0.2,
-    lambda_dreg: 0.01,
+    # --- 损失函数权重 ---
+    lambda_dssim: 0.2,                 # SSIM损失权重
+    lambda_dreg: 0.01,                 # 缩放正则化权重
 
-    lambda_normal: 0.00,
+    lambda_normal: 0.00,               # 法线一致性损失(仅2DGS变体)
     normal_start_iter: 7_000,
-    lambda_dist: 0.00,
+    lambda_dist: 0.00,                 # 深度畸变损失(仅2DGS变体)
     dist_start_iter: 3_000,
     
-    start_stat: 500,
-    update_from: 1500,
-    update_interval: 100,
-    update_until: 20000,
-    overlap: False,
-    densification: True,
+    # ==================== Scaffold-GS以Anchor为基元做致密化以及剪枝操作(Anchor管着Gaussian),不直接对Gaussian操作 ==================
+    # --- 致密化操作 ---
+    # 以Gaussian梯度为依据,当梯度大于对应的Voxel Grid相应梯度,并且下一级更细的Voxel中无anchor,设置新anchor点(位置在细Voxel中心)
+    # 新Anchor是梯度大于阈值的高斯基元所在下一层的Voxel 中心,旧anchor可能会落在细Voxel Grid中心或边缘(取决于对齐)
+    start_stat: 500,                   # 开始收集梯度统计的迭代步
+    update_from: 1500,                 # 开始执行致密化的迭代步
+    update_interval: 100,              # 每100步触发一次致密化,anchor点添加
+    update_until: 20000,               # ▼ 致密化截止迭代步(比LOD模型的25000更早)
+    overlap: False,                    # 是否允许新锚点与已有锚点重叠
+    densification: True,               # 是否启用致密化
 
-    min_opacity: 0.005,
-    success_threshold: 0.8,
-    densify_grad_threshold: 0.0002,
+    # --- 剪枝/生长阈值 ---
+    # 每步训练累积两个统计量: anchor 被渲染次数 (anchor_demon) 和其管辖的 k 个高斯 opacity 之和 (opacity_accum)。
+    # 每 100 步检查一次：若某 anchor 被渲染超过 80 次（统计可靠）且每帧平均 opacity 总贡献低于 0.005（几乎透明），则连同其 k 个高斯一并删除。
+    # 存活的 anchor 统计量归零，下一轮重新累积。核心逻辑：被充分观察但始终贡献极低的 anchor 会被移除。
+    min_opacity: 0.005,                # 低于此不透明度的锚点会被剪枝
+    success_threshold: 0.8,            # 锚点需被渲染足够多次才参与剪枝判断
+    densify_grad_threshold: 0.0002,    # 梯度阈值τ_g(固定值, 不随层级变化)
+    # ============================================================
+    # ▼ 注意: 基线模型没有以下 Octree-GS 独有参数:
+    #   coarse_iter, coarse_factor   → 无渐进式训练
+    #   update_ratio, extra_ratio, extra_up → 无跨层生长/ΔL更新
+    # ============================================================
 }
