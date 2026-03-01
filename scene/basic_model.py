@@ -366,7 +366,7 @@ class BasicModel:
             matches = (selected_grid_coords_unique.unsqueeze(1) == grid_coords.unsqueeze(0)).all(-1)
             counts = matches.sum(dim=1)
 
-        remove_duplicates = counts >= num_overlap  # 匹配数 >= 阈值 → 标记为重复
+        remove_duplicates = counts >= num_overlap  # 匹配数 >= 阈值(默认为1) → 标记为重复
 
         return remove_duplicates
     

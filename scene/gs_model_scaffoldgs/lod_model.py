@@ -892,6 +892,13 @@ class GaussianLoDModel(BasicModel):
           (c) ΔL更新: 锚点级梯度 > τ_L×extra_ratio → _extra_level += extra_up
               ⚠ 仅在渐进训练结束后才执行!
         
+        关于渐进性训练轮次(什么时候开放跨层生长 & Δ更新):
+            1) 总训练轮次:默认为40K 渐进式总训练轮次:10K
+            2) 渐进式训练过程中LOD层次逐层开放: coarse_factor = 1.5,q=1/coarse_factor=1/1.5=0.667,       
+            3) 以注释中K=6 init_level=3,num_level=2(待解锁的LOD层次)为例: 等比数列 a1+a1*q+a1*q^2 = 10K,a1 =4735 a1*q = 3158 a1*q^2 = 2106
+            4) [a1,a1+a1*q,a1+a1*q+a1*q^2] = [4735,7893,10000] 在0-4735轮次只进行init_level训练,在4735-7893轮+解锁1层,在7893-10000轮次解锁2层
+            5) 10K-40K轮次开放跨层生长+ΔL更新(任然可以进行同层生长)
+            
         动态阈值公式(LOD层级越高,Voxel越精细,阈值越高):
           τ_L = threshold × (fork^update_ratio)^L
           即更细的层 → 更高的梯度阈值 → 需要更强的证据才能生长
@@ -931,7 +938,7 @@ class GaussianLoDModel(BasicModel):
             # ===== 基于梯度的三种生长条件(grad是每个高斯基元在2D屏幕上平均梯度) =====
             # (a) 同层生长: τ_L ≤ grad < τ_{L+1}
             candidate_mask = (grads >= cur_threshold) & (grads < ds_threshold)      # candidate_mask(本层LOD阈值)针对Gaussian
-            # (b) 跨层生长: grad ≥ τ_{L+1} (梯度很大, 需要更细的层来表示)
+            # (b) 跨层生长: grad ≥ τ_{L+1}(梯度很大, 需要更细的层来表示)
             candidate_ds_mask = (grads >= ds_threshold)                             # 针对Gaussian而言,下一层Gaussian阈值
             # (c) ΔL更新: 锚点级梯度 ≥ τ_L × extra_ratio
             candidate_extra_mask = (anchor_grads >= extra_threshold)
@@ -945,26 +952,28 @@ class GaussianLoDModel(BasicModel):
             
             # 只对当前层的锚点(LOD=cur_level)应用anchor的生成(包括同级/下一级增长)
             repeated_mask = repeat(level_mask, 'n -> (n k)', k=self.n_offsets)      # 用于将Anchor级别的Mask扩展到Gaussian级别,用于Anchor所管辖的Gaussian筛选(表明这些GS都是Cur_Level级别Anchor所管辖)
-            candidate_mask = torch.logical_and(candidate_mask, repeated_mask)       # 同层生长候选(筛选同级生长τ_L ≤ grad < τ_{L+1}的Gaussian)
-            candidate_ds_mask = torch.logical_and(candidate_ds_mask, repeated_mask) # 跨层生长候选(筛选下一级生长 grad ≥ τ_{L+1} 的Gaussian)
+            candidate_mask = torch.logical_and(candidate_mask, repeated_mask)       # 同层生长候选(筛选τ_L ≤ grad < τ_{L+1}并且归属于LOD=Cur_Level Anchor管辖的Gaussian)
+            candidate_ds_mask = torch.logical_and(candidate_ds_mask, repeated_mask) # 跨层生长候选(筛选grad ≥ τ_{L+1} 并且归属于LOD=Cur_Level的Gaussian)
             candidate_extra_mask = torch.logical_and(candidate_extra_mask, level_mask)  # ΔL更新候选(筛选本层Anchor, anchor_grads ≥ τ_L × extra_ratio)
             
             # (c) ΔL更新: 仅在渐进训练结束后执行
             if ~self.progressive or iteration > self.coarse_intervals[-1]:
                 self._extra_level += extra_up * candidate_extra_mask.float()    
 
-            # ===== (a) 同层生长: 在当前层体素网格中添加新锚点 =====
+            # ===== (a) 同层生长: 在当前层体素网格中添加新锚点 =============================================
             # 计算候选Gaussian基元的世界坐标 (anchor + offset * scaling)
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
 
-            # 将当前层(LOD=cur_level)已有Anchor点,转换为网格坐标 (用于去重)
+            # 将当前层(LOD=cur_level)已有Anchor点,转换为当前LOD层的体素网格坐标 (用于去重)
             grid_coords = torch.round((self.get_anchor[level_mask]-self.init_pos)/cur_size - self.padding).int()
+
             # 将候选Gaussian基元坐标转换为网格坐标
+            # Gaussian 可能落在同一个体素里,所以需要去重。selected_grid_coords_unique: 去重后的唯一网格坐标
+            # inverse_indices: 长度与原始 selected_grid_coords 相同,记录每个原始Gaussian对应去重后的第几个唯一体素
             selected_xyz = all_xyz.view([-1, 3])[candidate_mask]        # 选择的同级生长τ_L ≤ grad < τ_{L+1}的Gaussian(所属LOD=Cur_Level的Anchor管辖)
             selected_grid_coords = torch.round((selected_xyz-self.init_pos)/cur_size - self.padding).int()
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)   # 进行同级增长的Gaussian对应的网格的去重
             
-            # 去重: 去掉与已有锚点重叠的体素 + 可见性检查
             if overlap:
                 # overlap模式: 允许重叠, 直接生成候选锚点, 只做可见性weed_out
                 remove_duplicates = torch.ones(selected_grid_coords_unique.shape[0], dtype=torch.bool, device="cuda")
@@ -978,33 +987,40 @@ class GaussianLoDModel(BasicModel):
                 # 非重叠模式: 先去除与已有锚点重复的体素, 再做weed_out
                 remove_duplicates = self.get_remove_duplicates(grid_coords, selected_grid_coords_unique)
                 remove_duplicates = ~remove_duplicates  # 取反: 保留“不重复”的
-                candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size + self.init_pos + self.padding * cur_size
-                new_level = torch.ones(candidate_anchor.shape[0], dtype=torch.int, device='cuda') * cur_level
-                candidate_anchor, new_level, _, weed_mask = self.weed_out(candidate_anchor, new_level)
-                remove_duplicates_clone = remove_duplicates.clone()
-                remove_duplicates[remove_duplicates_clone] = weed_mask
+                candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size + self.init_pos + self.padding * cur_size    # 同层生长新增的Anchor点
+                new_level = torch.ones(candidate_anchor.shape[0], dtype=torch.int, device='cuda') * cur_level   # 新增Anchor对应的LOD层级
+                candidate_anchor, new_level, _, weed_mask = self.weed_out(candidate_anchor, new_level)   # weed_out: 移除可见频率小于阈值的Anchor(如果新增的Anchor不能被大部分的相机捕获到,就不必增加)
+                remove_duplicates_clone = remove_duplicates.clone()                                      
+                remove_duplicates[remove_duplicates_clone] = weed_mask                                   # weed_mask: weed_out后保留的同级增长的Anchor
                 
             else:
+                # 没有新增Anchor点,本轮同层生长无事发生"的占位处理。
                 candidate_anchor = torch.zeros([0, 3], dtype=torch.float, device='cuda')
                 remove_duplicates = torch.zeros(selected_grid_coords_unique.shape[0], dtype=torch.bool, device='cuda')
                 new_level = torch.zeros([0], dtype=torch.int, device='cuda')
 
-            # ===== (b) 跨层生长: 在下一层(L+1)体素网格中添加新锚点 =====
+            # ===== (b) 跨层生长(在渐进性训练结束后): 在下一层(L+1)体素网格中添加新锚点 ================================
             # 同样的去重 + weed_out 流程, 但用更细的ds_size体素网格
-            grid_coords_ds = torch.round((self.get_anchor[level_ds_mask]-self.init_pos)/ds_size-self.padding).int()
-            selected_xyz_ds = all_xyz.view([-1, 3])[candidate_ds_mask]
-            selected_grid_coords_ds = torch.round((selected_xyz_ds-self.init_pos)/ds_size-self.padding).int()
+            grid_coords_ds = torch.round((self.get_anchor[level_ds_mask]-self.init_pos)/ds_size-self.padding).int() # level_ds_mask是LOD=Cur_Level+1的anchor掩码(当前存在的所有Anchor做筛选)
+            selected_xyz_ds = all_xyz.view([-1, 3])[candidate_ds_mask] # 筛选出grad ≥ τ_{L+1}的Gaussian,用于下一层Anchor点新增设置
+            selected_grid_coords_ds = torch.round((selected_xyz_ds-self.init_pos)/ds_size-self.padding).int()   # Gaussian在更精细的Voxel Grid进行网格化
             selected_grid_coords_unique_ds, inverse_indices_ds = torch.unique(selected_grid_coords_ds, return_inverse=True, dim=0)
-            # 跨层生长仅在渐进训练结束后且未到最细层时才执行
+            
+            # 跨层生长启动的条件: 渐进训练已结束 & 当前层不是最细层(cur_level < levels - 1)
             if (~self.progressive or iteration > self.coarse_intervals[-1]) and cur_level < self.levels - 1:
                 if overlap:
+                    # 如果采用重叠模式,允许新增的Anchor点与原有的Anchor在同一体素(层级=cur_level+1)内
+                    # 全部保留，不与已有的 L+1 层 anchor 做去重
                     remove_duplicates_ds =  torch.ones(selected_grid_coords_unique_ds.shape[0], dtype=torch.bool, device="cuda")
                     candidate_anchor_ds = selected_grid_coords_unique_ds[remove_duplicates_ds]*ds_size+self.init_pos+self.padding*ds_size
                     new_level_ds = torch.ones(candidate_anchor_ds.shape[0], dtype=torch.int, device='cuda') * (cur_level + 1)
                     candidate_anchor_ds, new_level_ds, _, weed_ds_mask = self.weed_out(candidate_anchor_ds, new_level_ds)
                     remove_duplicates_ds_clone = remove_duplicates_ds.clone()
                     remove_duplicates_ds[remove_duplicates_ds_clone] = weed_ds_mask
+
                 elif selected_grid_coords_unique_ds.shape[0] > 0 and grid_coords_ds.shape[0] > 0:
+                    # 采用非重叠模式,新增的Anchor点与原有的Anchor不允许在同一体素(层级=cur_level+1)内
+                    # 要使用原有的Anchor点在新Voxel Grid中的坐标去重
                     remove_duplicates_ds = self.get_remove_duplicates(grid_coords_ds, selected_grid_coords_unique_ds)
                     remove_duplicates_ds = ~remove_duplicates_ds
                     candidate_anchor_ds = selected_grid_coords_unique_ds[remove_duplicates_ds]*ds_size+self.init_pos+self.padding*ds_size
@@ -1013,26 +1029,34 @@ class GaussianLoDModel(BasicModel):
                     remove_duplicates_ds_clone = remove_duplicates_ds.clone()
                     remove_duplicates_ds[remove_duplicates_ds_clone] = weed_ds_mask
                 else:
+                    # 没有候选Gaussian 或 L+1层没有已有anchor → 跨层生长无事发生
                     candidate_anchor_ds = torch.zeros([0, 3], dtype=torch.float, device='cuda')
                     remove_duplicates_ds = torch.zeros(selected_grid_coords_unique_ds.shape[0], dtype=torch.bool, device='cuda')
                     new_level_ds = torch.zeros([0], dtype=torch.int, device='cuda')
             else:
+                # 跨层增长的条件不满足: 渐进训练未结束 或 当前层已是最高层
                 candidate_anchor_ds = torch.zeros([0, 3], dtype=torch.float, device='cuda')
                 remove_duplicates_ds = torch.zeros(selected_grid_coords_unique_ds.shape[0], dtype=torch.bool, device='cuda')
                 new_level_ds = torch.zeros([0], dtype=torch.int, device='cuda')
 
-            # ===== 将同层+跨层的新锚点合并, 初始化属性并加入优化器 =====
+            # ===== 将同层+跨层的新增长的Anchor进行合并, 初始化属性并加入优化器 ================================================
+            # cat_tensors_to_optimizer: 继承自 BasicModel，将新参数追加到优化器中
+            # 内部逻辑: 对每个参数组，将新tensor cat到已有tensor后面,同时为新tensor初始化 Adam 的动量状态 (exp_avg=0, exp_avg_sq=0)
             if candidate_anchor.shape[0] + candidate_anchor_ds.shape[0] > 0:
                 
-                new_anchor = torch.cat([candidate_anchor, candidate_anchor_ds], dim=0)
+                # 合并同层 + 跨层的新 anchor
+                new_anchor = torch.cat([candidate_anchor, candidate_anchor_ds], dim=0)      
                 new_level = torch.cat([new_level, new_level_ds]).unsqueeze(dim=1).float().cuda()
                 
-                # 特征初始化: 从父锚点继承特征, 同一体素内多个候选取max聚合
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
-                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+                # 同层新anchor的特征: 从触发生长的Gaussian的父anchor继承特征
+                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]      # 将Anchor的特征进行扩展到其管辖的GS中,并筛选同层分裂的Gaussian
+                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]    # Scatter_max: 多个Gaussian落入同一体素 → 取各维度最大值聚合为一个特征
+                # inverse_indices 告诉每个Gaussian属于哪个唯一体素 → 按体素分组取max [remove_duplicates] 过滤掉被去重和weed_out淘汰的体素(体素中心设置新Anchor)
+
+                # 跨层新anchor的特征(与上面同理)                                                                                                                       
                 new_feat_ds = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_ds_mask]
                 new_feat_ds = scatter_max(new_feat_ds, inverse_indices_ds.unsqueeze(1).expand(-1, new_feat_ds.size(1)), dim=0)[0][remove_duplicates_ds]
-                new_feat = torch.cat([new_feat, new_feat_ds], dim=0)
+                new_feat = torch.cat([new_feat, new_feat_ds], dim=0)    # 合并同层+跨层的特征
                 
                 # 缩放初始化: 同层用cur_size, 跨层用ds_size (log空间, 因为用exp激活)
                 new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size
@@ -1043,36 +1067,37 @@ class GaussianLoDModel(BasicModel):
                 # 旋转初始化为单位四元数
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], dtype=torch.float, device='cuda')
                 new_rotation_ds = torch.zeros([candidate_anchor_ds.shape[0], 4], dtype=torch.float, device='cuda')
-                new_rotation = torch.cat([new_rotation, new_rotation_ds], dim=0)
+                new_rotation = torch.cat([new_rotation, new_rotation_ds], dim=0)    # 合并同层+跨层的特征
                 new_rotation[:,0] = 1.0
 
                 # 偏移量初始化为0, ΔL初始化为0
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
                 new_offsets_ds = torch.zeros_like(candidate_anchor_ds).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
-                new_offsets = torch.cat([new_offsets, new_offsets_ds], dim=0)
+                new_offsets = torch.cat([new_offsets, new_offsets_ds], dim=0)       # 合并同层+跨层的特征
 
                 new_extra_level = torch.zeros(candidate_anchor.shape[0], dtype=torch.float, device='cuda')
                 new_extra_level_ds = torch.zeros(candidate_anchor_ds.shape[0], dtype=torch.float, device='cuda')
-                new_extra_level = torch.cat([new_extra_level, new_extra_level_ds])
+                new_extra_level = torch.cat([new_extra_level, new_extra_level_ds])  # 合并同层+跨层的特征
                 
                 d = {
-                    "anchor": new_anchor,
-                    "scaling": new_scaling,
-                    "rotation": new_rotation,
-                    "anchor_feat": new_feat,
-                    "offset": new_offsets,
+                    "anchor": new_anchor,           # 新anchor坐标
+                    "scaling": new_scaling,         # 新anchor缩放参数
+                    "rotation": new_rotation,       # 新anchor旋转四元数
+                    "anchor_feat": new_feat,        # 新anchor特征向量
+                    "offset": new_offsets,          # 新anchor管辖的Gaussian相对偏移量
                 }   
 
                 temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_anchor.shape[0], 1], device='cuda').float()], dim=0)
                 del self.anchor_demon
-                self.anchor_demon = temp_anchor_demon
+                self.anchor_demon = temp_anchor_demon   # 更新Anchor的观测统计量(加入新anchor点后)
 
                 temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_anchor.shape[0], 1], device='cuda').float()], dim=0)
                 del self.opacity_accum
-                self.opacity_accum = temp_opacity_accum
+                self.opacity_accum = temp_opacity_accum   # 更新Anchor的不透明度累积量(加入新anchor点后,用于剪枝)
 
                 torch.cuda.empty_cache()
                 
+                # 更新模型的 nn.Parameter 引用（现在包含旧+新的全部anchor)
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
                 self._anchor = optimizable_tensors["anchor"]
                 self._scaling = optimizable_tensors["scaling"]
@@ -1083,7 +1108,8 @@ class GaussianLoDModel(BasicModel):
                 self._extra_level = torch.cat([self._extra_level, new_extra_level], dim=0)
     
     # ==========================================================================
-    # 【阶段四-编排】完整的致密化流程: 生长 + 剪枝,每100步调用一次run_densify()
+    # 【阶段四-完整致密化流程】Anchor增长(同级/跨级)+Anchor点删除, 每隔update_interval(默认100)调用一次
+    # 在本函数中调用anchor_growing()和prune_anchor()完成
     # ==========================================================================
     def run_densify(self, iteration, opt):
         """【阶段四】执行一次完整的致密化操作: 生长新锚点 + 剪枝低贡献锚点。
@@ -1112,30 +1138,30 @@ class GaussianLoDModel(BasicModel):
         grads_norm = torch.norm(grads, dim=-1) # [N*k, 1],取范数,Gaussian基元平均梯度的模长
         offset_mask = (self.offset_denom > opt.update_interval * opt.success_threshold * 0.5).squeeze(dim=1)    # 观测次数超过阈值的Gaussian的累积梯度才有可靠性
         
-        # ===== Step 2: 锚点生长 =====
+        # ===== Step 2: 锚点生长(anchor的同级生长+跨级生长) 跨级生长要在渐进化训练之后 =====
         self.anchor_growing(iteration, grads_norm, opt.densify_grad_threshold, opt.update_ratio, opt.extra_ratio, opt.extra_up, offset_mask, opt.overlap)
         
         # ===== Step 3: 重置梯度统计量并为新增锚点补充空间 =====
-        self.offset_denom[offset_mask] = 0
+        self.offset_denom[offset_mask] = 0          # 可靠的Gaussian基元的观测次数已经经过判断了,重置为0
         padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
                                            dtype=torch.int32, 
                                            device=self.offset_denom.device)
-        self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
+        self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0) # 为新增的Anchor管辖的Gaussian基元补充观测次数空间
 
-        self.offset_gradient_accum[offset_mask] = 0
+        self.offset_gradient_accum[offset_mask] = 0 # Gaussian基元的累积梯度重置为0
         padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_gradient_accum.shape[0], 1],
                                            dtype=torch.int32, 
                                            device=self.offset_gradient_accum.device)
-        self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
+        self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0) # 为新增的Anchor管辖的Gaussian基元补充累积梯度空间
         
         # ===== Step 4: 锚点剪枝 =====
-        # 剪枝条件1: 不透明度低于阈值 (opacity_accum < min_opacity × 渲染次数)
+        # 剪枝条件1: 不透明度低于阈值 (opacity_accum(Anchor点累积不透明度) < min_opacity × 渲染次数)
         prune_mask = (self.opacity_accum < opt.min_opacity*self.anchor_demon).squeeze(dim=1)
         # 剪枝条件2: 被足够多次渲染 (避免误剪刚初始化的锚点)
         anchors_mask = (self.anchor_demon > opt.update_interval * opt.success_threshold).squeeze(dim=1)
-        prune_mask = torch.logical_and(prune_mask, anchors_mask)  # 两个条件同时满足才剪
+        prune_mask = torch.logical_and(prune_mask, anchors_mask)  # 两个条件同时满足才剪,anchor点的剪枝mask掩码
         
-        # ===== Step 5: 更新剪枝后的统计量 =====
+        # ===== Step 5: 更新剪枝后的统计量(Anchor点以及其管辖的Gaussian基元) =====
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
         offset_denom = offset_denom.view([-1, 1])
         del self.offset_denom
@@ -1160,7 +1186,7 @@ class GaussianLoDModel(BasicModel):
         self.anchor_demon = temp_anchor_demon
 
         if prune_mask.shape[0]>0:
-            self.prune_anchor(prune_mask)
+            self.prune_anchor(prune_mask)       # 执行剪枝操作
 
     # ==========================================================================
     # MLP Checkpoint保存/加载 (TorchScript格式, 用于部署)
@@ -1194,17 +1220,17 @@ class GaussianLoDModel(BasicModel):
             self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
     
     # ==========================================================================
-    # 【阶段二/五】核心前向函数: 将锚点特征解码为神经高斯属性
+    # 【阶段二/五】核心前向函数: MLP预测Gaussian属性(根据Anchor点的特征/观测方向/外观嵌入)
     # 在渲染器 render() 中调用, 是 Scaffold-GS/Octree-GS 的核心解码流程
     # ==========================================================================
     def generate_neural_gaussians(self, viewpoint_camera, visible_mask=None, ape_code=-1):
         """【阶段二/五】从锚点特征解码生成神经高斯的完整属性。
         
         这是 Scaffold-GS/Octree-GS 的核心前向函数, 在渲染器 render() 中调用。
-        将锚点的特征向量通过MLP解码为每个神经高斯的: 位置、颜色、不透明度、缩放、旋转。
+        将锚点的特征向量通过MLP解码为每个神经高斯的: 位置、颜色、不透明度、(协方差)缩放、旋转。
         
         解码流程:
-          1. 提取可见锚点的特征和属性
+          1. 提取可见anchor点的特征和属性
           2. 计算观察方向 (anchor → camera 的单位向量)
           3. (可选) 特征银行: 多分辨率特征加权融合
           4. 拼接 [特征 + 观察方向] 作为MLP输入
@@ -1241,12 +1267,13 @@ class GaussianLoDModel(BasicModel):
         ob_dist = ob_view.norm(dim=1, keepdim=True)         # [n, 1] 锚点到相机的距离
         ob_view = ob_view / ob_dist                         # [n, 3] 归一化为单位方向向量
 
-        # ===== Step 3: (可选) 特征银行: 视角自适应的多分辨率特征融合 =====
+        # ===== Step 3: (可选) Feature Bank: 视角自适应的多分辨率特征融合 =====
+        # Feature Bank 由两个部分组成: Feature Bank MLP & 一套多分辨率特征采样策略。
         if self.use_feat_bank:
             bank_weight = self.get_featurebank_mlp(ob_view).unsqueeze(dim=1) # [n, 1, 3] 三个分辨率的权重
 
             # 将特征分为三个频率: 1/4采样(低频) + 1/2采样(中频) + 全采样(高频)
-            # 用视角依赖的权重加权融合
+            # 用视角依赖的权重加权融合,对Anchor_feat(32维度)通过不同步长的下采样产生三种分辨率特征
             feat = feat.unsqueeze(dim=-1)
             feat = feat[:,::4, :1].repeat([1,4,1])*bank_weight[:,:,:1] + \
                 feat[:,::2, :1].repeat([1,2,1])*bank_weight[:,:,1:2] + \
@@ -1267,26 +1294,33 @@ class GaussianLoDModel(BasicModel):
                 camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * ape_code[0]
                 appearance = self.get_appearance(camera_indicies)
                 
-        # ===== Step 6: MLP解码 =====
-        # 6a. 不透明度: [N, k] 每个锚点的k个高斯的不透明度
+        # ===== Step 6: MLP解码 ===============
+        # 6a. MLP预测Gaussian不透明度: [N, k] 每个锚点的k个高斯的不透明度
         neural_opacity = self.get_opacity_mlp(cat_local_view) # [N, k]
 
         # 【progressive模式】对处于临界层的锚点做不透明度平滑过渡
-        # prog_ratio 是小数部分, 用于在层级边界处做软过渡, 避免突变
+        # 在LODModel配置文件中默认使用"round"模式, 即四舍五入硬切换,当L*超过.5边界,层级直接跳变
+        # 而Progressive模式采用向下取整+小数点部分做不透明度过渡(anchor的不透明度逐渐从0->1),平滑的软过渡
         if self.dist2level=="progressive":
             prog = self._prog_ratio[visible_mask]
             transition_mask = self.transition_mask[visible_mask]
             prog[~transition_mask] = 1.0    # 非临界层的不透明度保持不变
             neural_opacity = neural_opacity * prog  # 临界层的不透明度乘以过渡系数
         
-        # 不透明度掩码: 只保留 opacity > 0 的高斯 (Tanh输出负值的被剔除)
+        # ================================= MLP输出动态过滤渲染的Gaussian==================================================
+        # 结构上每个 anchor 固定对应 k=10 个 Gaussian，但实际渲染时会有 mask 动态过滤掉一部分。这比固定 k 个全部参与渲染要更高效。
+        # 用 Tanh + mask 机制让模型自动学习每个 anchor 需要多少个 Gaussian。对于纹理简单的区域,
+        # MLP会学会把多余 Gaussian 的不透明度输出为负值, 相当于"自动关闭"不需要的 Gaussian 基元节省渲染开销。
+        # ================================================================================================================
+        
+        # 不透明度掩码: 只保留opacity > 0 的高斯 (Tanh输出负值的被剔除)
         neural_opacity = neural_opacity.reshape([-1, 1])   # [N*k, 1]
         mask = (neural_opacity>0.0)
         mask = mask.view(-1)            # [N*k] 有效高斯的掩码
 
         opacity = neural_opacity[mask]  # [M, 1] 保留的有效不透明度
 
-        # 6b. 颜色: [N, k*3] → [N*k, 3]
+        # 6b. MLP预测Gaussian颜色: [N, k*3] → [N*k, 3]
         # 【阶段五】如果使用外观嵌入, 输入 = [特征+观察方向+外观码]
         if self.appearance_dim > 0:
             color = self.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
@@ -1294,7 +1328,7 @@ class GaussianLoDModel(BasicModel):
             color = self.get_color_mlp(cat_local_view)
         color = color.reshape([anchor.shape[0]*self.n_offsets, 3])
 
-        # 6c. 协方差: [N, k*7] → [N*k, 7] (3维缩放 + 4维旋转)
+        # 6c. MLP预测Gaussian协方差: [N, k*7] → [N*k, 7] (3维缩放 + 4维旋转)
         scale_rot = self.get_cov_mlp(cat_local_view)
         scale_rot = scale_rot.reshape([anchor.shape[0]*self.n_offsets, 7])
         
@@ -1302,12 +1336,12 @@ class GaussianLoDModel(BasicModel):
         offsets = grid_offsets.view([-1, 3])
         
         # ===== Step 7: 并行掩码 + 后处理 =====
-        # 将所有属性拼接后统一应用mask, 提高GPU并行效率
-        concatenated = torch.cat([grid_scaling, anchor], dim=-1)  # [N, 9] = [6+3]
-        concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=self.n_offsets)  # [N*k, 9]
-        concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)  # [N*k, 22]
-        masked = concatenated_all[mask]     # [M, 22] 只保留有效高斯
-        scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+        # 先把所有属性打包并用 mask 统一过滤，然后后处理得到最终的 Gaussian 属性
+        concatenated = torch.cat([grid_scaling, anchor], dim=-1)  # [N, 9] = [6+3],不依赖MLP的属性(Scale6维+Anchor坐标3维)
+        concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=self.n_offsets)  # [N*k, 9],扩展到Gaussian级别
+        concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)  # [N*k, 22],拼接所有属性, [缩放6 + anchor坐标3 + 颜色3 + 缩放旋转7 + 偏移3] = 22维
+        masked = concatenated_all[mask]     # 经过Mask掩码(opacity>0,一次性过滤所有属性比逐个过滤更高效),渲染时只保留有效高斯 [M,22]
+        scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)    # 再拆分回各属性(经过过滤后的Gaussian属性)
         
         # 后处理协方差: 
         # 最终缩放 = 锚点缩放(后3维) × sigmoid(MLP输出前3维)
@@ -1320,4 +1354,5 @@ class GaussianLoDModel(BasicModel):
         offsets = offsets * scaling_repeat[:,:3]
         xyz = repeat_anchor + offsets 
         
+        # 返回所有高斯属性(经过掩码过滤后的有效高斯)
         return xyz, color, opacity, scaling, rot, None, mask
