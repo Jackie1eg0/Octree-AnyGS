@@ -204,7 +204,7 @@ class BasicModel:
         在 train.py 的主循环中, 每次渲染后调用。收集三类统计量:
           1. opacity_accum:         每个锚点的不透明度累积 (用于剪枝判断)
           2. anchor_demon:          每个锚点被渲染的次数 (用于归一化)
-          3. offset_gradient_accum: 每个神经高斯的屏幕空间梯度累积 (用于生长判断)
+          3. offset_gradient_accum: 每个神经高斯的屏幕空间2D梯度累积 (用于生长判断)
         
         实现逻辑:
           Step 1: 从 render_pkg 中提取渲染结果
@@ -224,14 +224,34 @@ class BasicModel:
             width:  渲染图像宽度 (用于梯度缩放)
             height: 渲染图像高度 (用于梯度缩放)
         
-        # 掩码逐层筛选关系 (逐层递减: N → N_vis → M → M'):
-        #   N 个锚点 (全部Anchor)
-        #     │
-        #     ├─ visible_mask [N]: LOD筛选(level<=floor(L*),当前相机位姿可观察到的LOD层级) + 视锥剔除 → N_vis 个可见锚点
-        #     │
-        #     ├─ selection_mask [N_vis*k]: MLP预测后 opacity>0 → M 个有效高斯
-        #     │
-        #     └─ visibility_filter [M]: gsplat光栅化后 radii>0 → M' 个实际着色的高斯
+        # 按照gaussian_renderer/render.py中的Mask调用顺序,理解如何从N个Anchor管辖的N*K个Gaussian ----(一步步筛选)----> 该帧(Image)渲染所涉及的Gaussian:
+        #   N 个锚点 (全部Anchor) --> 总共具有N*K个Gaussian(有效GS+无效GS) PS:此处有效+无效指的是MLP预测的GS Opacity>0还是<=0
+        #   
+        #   Step1(Anchor点LOD级别筛选): 第一层筛选(_anchor_mask LOD层级筛选): 该帧Image具有相机的位姿(包含相机坐标+相机朝向),Anchor点的位置可知(不同LOD层级的Anchor点位置可确定) ==> 可用Anchor到相机中心距离计算LOD层级L*,将L*映射为离散整数(round/progressive)
+        #          筛选条件: anchor_level <= int_level 只要LOD层级<=该相机可见的最大LOD层级,就留下,因为相机可观察到这些层级
+        #   
+        #   Step2(Anchor点视锥剔除): 第二层筛选(visible_mask Anchor级别的视锥剔除Frustum Culling ), 经过第一层剔出的Gaussian仅满足其所属Anchor的LOD层级<=该相机到Anchor最大可见层级,但是Anchor可能不在相机视锥以内
+        #          视锥之外的Anchor对该帧的渲染起不到任何作用,其经过Splat不会在屏幕留下痕迹,因此可以做视锥剔除
+        #   疑难区分:视锥体的剔除逻辑:是Anchor(有Scaling前三维参数,可以视为一个粗粒度的3DGS)经过Splat到2D屏幕看是否有投影的2D Gaussian Or 从屏幕出发根据相机内存+外参构建3D视锥体,看Anchor点是否在视锥体内
+        #   答案是第一种:Anchor在做视锥剔除时,前3维 scaling + rotation 定义了一个 3D 椭球体,按照Splat到2D屏幕上,若Radii>0(2D 椭球在平面上显现),其管辖的Gaussian才有资格进入后续的MLP解码
+        #       得到的Visible_mask[N],Bool型Mask,同时编码了LOD筛选+视锥剔除 N ==> N_Vis
+        #   
+        #   Step3(Gaussian级别剔除,MLP预测有效的Gaussian满足Opacity>0):为减小MLP计算开销,只有经过LOD级别筛选+视锥剔除得到的N_Vis数量的Anchor点,才能进入MLP预测
+        #           提取N_Vis个筛选的Anchor点(LOD级别满足要求+落在该帧相机的视锥以内),N_Vis个Anchor点特征,每个Anchor点特征32维度+View_dim(相机到Anchor观察方向)==> 作为MLP_Opacity输入
+        #           N_Vis个Anchor点特征+View_dim(相机到Anchor观察方向)==> MLP_Opacity(N_Vis,n_offsets) ==> 得到selection_mask[N_Vis*n_offsets],True的数量是有效的GS数量(Opacity>0)
+        #
+        #   Step4(Gaussian级别筛选,光栅化投影Gaussian,筛选出真正参与了像素着色的Gaussian)
+        #           虽然Gaussian经过上述三步骤筛选,visibility_filter是光栅化过程的自然产品,需要注意两点
+        #           1.Anchor级别视锥剔除≠Gaussian级别视锥剔除:Step2的视锥剔除是在Anchor级别做的,但是不代表其管辖的Gaussian都在视锥以内,因为GS的最终位置是anchor+offset*scaling[:3],因此一个Anchor在屏幕中央,但其管辖的GS可能通过Offset偏移到屏幕之外,投影后radii=0,被剔除
+        #           2.即使Anchor所属的Gaussian在视锥以内,radii也可能为0,一方面可能Gaussian的Scaling极小,投影到屏幕椭圆半径接近0 另一方面GS位于近平面之后被裁剪  
+        #   光栅化的过程: 3D Gaussian Splatting 到 2D 屏幕(涉及坐标系转换:W2C + 3D Gaussian --Splat-->2D Gaussian(屏幕空间))
+        #                2D 协方差 → 投影半径 radii(对2*2的Σ2D求最大特征值,取3σ范围的整数Pixel半径)
+        #                屏幕范围检查: GS中心投影到屏幕像素坐标(Px,Py),检查[px-radii, px+radii] X [py-radii, py+radii]是否与屏幕[0,W] X [0,H]重叠 完全不相交 ==> radii=0
+        #                radii=0的GS有如下情况: 1)深度在近/远平面之外 2)Scaling极小 3)投影的Gaussian完全在屏幕之外
+        #   着色阶段:Tile-Based Rasterization,将屏幕分成多个Tile,深度排序,逐像素着色,每个Tile独立着色,可以并行处理
+        #   
+        #   Step5(Anchor累积Opacity):Step1+2+3筛选后的Gaussian(不包含Step4光栅化剔除的Gaussian):为判断Anchor是否需要剪枝,即使GS没有被光栅化渲染(radii=0),但只要MLP认为其有效Opacity>0,就说明这个Anchor还在做渲染贡献
+        #        (Anchor梯度累积):用的是Step1+2+3+4筛选后的Gaussian,判断Anchor是否需要增长,只有真正参与Pixel着色的Gaussian才有有效梯度,必须经过Step4光栅化
         """
         # =====================================================================
         # Step 1: 从 render_pkg 字典中提取本帧渲染的关键结果
