@@ -15,23 +15,24 @@ basic_model.py — Scaffold-GS / Octree-GS 高斯模型基类
 本文件定义了 BasicModel 基类, 作为所有高斯模型 (GaussianModel, GaussianLoDModel 等) 的父类。
 它提供了模型训练和致密化过程中的通用功能:
 
+# 用 LOD 配置时，主要看 lod_model.py + basic_model.py
 ┌──────────────────────────────────────────────────────────────────┐
-│                        BasicModel (基类)                        │
+│                        BasicModel (基类)                          │
 ├──────────────────────────────────────────────────────────────────┤
 │ 1. 激活函数设置: setup_functions()                                │
 │ 2. 优化器管理:                                                    │
-│    - replace_tensor_to_optimizer(): 替换优化器中的参数              │
+│    - replace_tensor_to_optimizer(): 替换优化器中的参数             │
 │    - cat_tensors_to_optimizer():    向优化器追加新参数(锚点生长)    │
-│    - _prune_anchor_optimizer():     从优化器移除参数(锚点剪枝)     │
+│    - _prune_anchor_optimizer():     从优化器移除参数(锚点剪枝)      │
 │ 3. 训练统计: training_statis()  收集梯度/不透明度统计量             │
 │ 4. 去重工具: get_remove_duplicates()  体素网格坐标去重              │
 │ 5. LOD映射: map_to_int_level()  连续LOD→离散层级映射               │
-│ 6. 默认空实现: eval/train/set_appearance 等(子类可覆盖)           │
+│ 6. 默认空实现: eval/train/set_appearance 等(子类可覆盖)            │
 └──────────────────────────────────────────────────────────────────┘
 
 子类关系:
   BasicModel (本文件)
-    ├── GaussianModel      (gs_model_scaffoldgs/model.py)  — 原版Scaffold-GS
+    ├── GaussianModel      (gs_model_scaffoldgs/base_model.py)  — 原版Scaffold-GS
     └── GaussianLoDModel   (gs_model_scaffoldgs/lod_model.py) — Octree-GS (LOD版本)
 """
 
@@ -61,8 +62,8 @@ class BasicModel:
         
         反激活函数用于将"物理值"转回"原始值"(如初始化时使用)。
         """
-        self.scaling_activation = torch.exp              # 缩放: exp确保正数
-        self.scaling_inverse_activation = torch.log      # 缩放反函数: log
+        self.scaling_activation = torch.exp               # 缩放: exp确保正数
+        self.scaling_inverse_activation = torch.log       # 缩放反函数: log
         self.opacity_activation = torch.sigmoid           # 不透明度: sigmoid→[0,1]
         self.inverse_opacity_activation = inverse_sigmoid # 不透明度反函数
         self.rotation_activation = torch.nn.functional.normalize  # 旋转: 归一化为单位四元数
@@ -193,7 +194,7 @@ class BasicModel:
 
         return optimizable_tensors
 
-    # ==========================================================================
+    # ==================== (核心模块:每帧渲染后调用,指导Anchor的grow & prune) ======================================
     # 训练统计收集 — 为致密化(阶段四)提供决策依据
     # 每个训练步的渲染结束后调用, 累积梯度和不透明度统计
     # ==========================================================================
@@ -207,52 +208,139 @@ class BasicModel:
         
         实现逻辑:
           Step 1: 从 render_pkg 中提取渲染结果
-          Step 2: 累积每个锚点下所有offset的不透明度总和 → opacity_accum
+          Step 2: 累积每个Anchor所管辖的所有Gaussians的不透明度总和 → opacity_accum
           Step 3: 可见锚点的渲染计数 +1 → anchor_demon
           Step 4: 计算屏幕空间梯度范数, 累积到 offset_gradient_accum
         
         参数:
-            render_pkg: dict, 渲染器返回的结果包, 包含:
-                viewspace_points:  [1, M, 2] 屏幕空间坐标 (含梯度)
-                visibility_filter: [M] bool, 渲染时可见的高斯掩码
-                visible_mask:      [N] bool, 可见锚点掩码 (来自prefilter)
-                selection_mask:    [N*k] bool, 有效神经高斯掩码 (opacity>0)
-                opacity:           [M, 1] 渲染的不透明度值
+            render_pkg: dict, 渲染器返回的字典, 包含一帧渲染的所有输出结果:
+                render:            [3, H, W] 渲染出来的RGB图像
+                scaling:           [M, 3] 每个Gaussian的缩放参数(假设Gaussian基元个数为M个)
+                viewspace_points:  [1, M, 2] 每个Gaussian在屏幕空间的2D坐标(means2d),带梯度,是致密化统计的核心
+                visibility_filter: [M] bool, 在该帧图片中实际被光栅化渲染的Gaussian Mask(真正对最终像素有贡献的Gaussian基元)
+                visible_mask:      [N] bool, 可见锚点掩码两层筛选 (LOD等级筛选仅仅保留level<=floor(L*)的Anchor+来自prefilter_voxel视锥剔除)
+                selection_mask:    [N*k] bool, 有效的高斯基元掩码 (opacity>0,MLP预测GS属性的时候,可以通过Opacity<=0来动态调整Anchor周围实际管辖的有效GS个数)
+                opacity:           [M, 1] 每个Gaussian基元的不透明度值(Opacity)
             width:  渲染图像宽度 (用于梯度缩放)
             height: 渲染图像高度 (用于梯度缩放)
-        """
-        viewspace_point_tensor = render_pkg["viewspace_points"]
-        update_filter = render_pkg["visibility_filter"]     # [M] 实际被渲染的高斯
-        anchor_visible_mask = render_pkg["visible_mask"]     # [N] 可见锚点
-        offset_selection_mask = render_pkg["selection_mask"] # [N*k] 有效高斯 (opacity>0)
-        opacity = render_pkg["opacity"]                      # [M, 1] 不透明度
         
-        # ===== Step 2: 累积不透明度 =====
-        # 将有效高斯的opacity填回全尺寸数组, 然后按锚点求和
+        # 掩码逐层筛选关系 (逐层递减: N → N_vis → M → M'):
+        #   N 个锚点 (全部Anchor)
+        #     │
+        #     ├─ visible_mask [N]: LOD筛选(level<=floor(L*),当前相机位姿可观察到的LOD层级) + 视锥剔除 → N_vis 个可见锚点
+        #     │
+        #     ├─ selection_mask [N_vis*k]: MLP预测后 opacity>0 → M 个有效高斯
+        #     │
+        #     └─ visibility_filter [M]: gsplat光栅化后 radii>0 → M' 个实际着色的高斯
+        """
+        # =====================================================================
+        # Step 1: 从 render_pkg 字典中提取本帧渲染的关键结果
+        # =====================================================================
+        # render_pkg 由 gaussian_renderer/render.py 的 render() 或 render_2dgs() 返回
+        # 其中 N=锚点总数, k=n_offsets(每锚点生成的高斯数), M=实际有效的神经高斯数
+        
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        # viewspace_points: [1, M, 2] — 每个神经高斯在屏幕空间的2D坐标(means2d)
+        #   这个张量在渲染时调用了 retain_grad(), 因此反向传播后 .grad 存储了
+        #   损失函数对屏幕空间坐标的梯度。梯度大 → 该位置渲染误差通过该高斯传播强 → 说明该区域欠拟合, 需要更多锚点
+
+        update_filter = render_pkg["visibility_filter"]
+        # visibility_filter: [M] bool — 光栅化时 radii > 0 的高斯(真正参与了像素着色的Gaussian基元)
+        #   即实际参与了像素着色的高斯。有些高斯虽然通过了 prefilter(视锥剔除+LOD筛选),但在光栅化阶段可能因投影半径为0而被跳过
+
+        anchor_visible_mask = render_pkg["visible_mask"]
+        # visible_mask: [N] bool — prefilter_voxel() 阶段确定的可见锚点
+        #   若为True = 该锚点通过了 LOD筛选 + 视锥剔除, 参与了本帧渲染
+
+        offset_selection_mask = render_pkg["selection_mask"]
+        # selection_mask: [N*k] bool — generate_neural_gaussians() 中标记的有效偏移
+        #   每个锚点生成 k 个候选高斯, 但只有 opacity > 0 的才是"有效高斯"(MLP预测GS属性的时候,可以通过Opacity<=0来动态调整Anchor周围实际管辖的有效GS个数)
+        #   True的数量 = M (有效神经高斯数)
+
+        opacity = render_pkg["opacity"]
+        # opacity: [M, 1] — 每个高斯基元的不透明度值 (经sigmoid激活后)
+        
+        # =====================================================================
+        # Step 2: 累积每个锚点的不透明度总和 → self.opacity_accum
+        # =====================================================================
+        # 用途: prune_anchor() 中, 如果 opacity_accum / anchor_demon < min_opacity,
+        #       说明该锚点长期贡献很低, 会被剪枝删除
+        #
+        # 思路: opacity 只包含 M 个有效高斯的值(MLP预测GS属性若Opacity<=0,则该位置的GS不会被渲染,仅仅占位), 但我们需要按锚点(N_Anchor)汇总,
+        #       所以先创建 [N_Anchor*k] 的全零数组, 把 M 个值填回对应位置, 再 reshape 求和
+
+        # 创建全零数组, 大小 = Anchor所管辖的全部高斯数(有效+无效) [N*k]
         temp_opacity = torch.zeros(offset_selection_mask.shape[0], dtype=torch.float32, device="cuda")
+        # 将有效高斯(MLP预测出的不透明度>0的GS)的opacity填入对应位置 (offset_selection_mask为True的位置)
+        # clone().detach(): 不参与梯度计算, 仅作统计用
         temp_opacity[offset_selection_mask] = opacity.clone().view(-1).detach()
         
-        temp_opacity = temp_opacity.view([-1, self.n_offsets])  # [N, k] 按锚点分组
-        self.opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)  # 按锚点求和
+        # reshape 为 [N, k], 每行是一个锚点的 k 个偏移位置的 opacity
+        temp_opacity = temp_opacity.view([-1, self.n_offsets])
+        # 按锚点求和(dim=1), 累加到 opacity_accum 中对应的可见锚点(只有Opacity>0的有效GS才会被渲染,才会把自己的不透明度加到对应的锚点上)
+        # keepdim=True 保持 [N_visible, 1] 的形状, 与 opacity_accum 对齐
+        self.opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)
         
-        # ===== Step 3: 累积锚点渲染次数 =====
-        self.anchor_demon[anchor_visible_mask] += 1
+        # =====================================================================
+        # Step 3: 累积锚点被渲染的次数 → self.anchor_demon
+        # =====================================================================
+        # 用途: 作为 opacity_accum 的归一化分母, 平均opacity = opacity_accum / anchor_demon
+        #       只有被渲染足够多次(> update_interval * success_threshold)
+        #       且平均opacity仍然很低的锚点, 才会被剪枝
+        self.anchor_demon[anchor_visible_mask] += 1 # 在该帧可见的Anchor点统计次数+1
 
-        # ===== Step 4: 累积屏幕空间梯度 =====
-        # 构建combined_mask: 标记哪些offset位置对应实际被渲染且可见的高斯
-        anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)  # [N*k]
+        # =====================================================================
+        # Step 4: 累积屏幕空间梯度范数 → self.offset_gradient_accum
+        # =====================================================================
+        # 用途: anchor_growing() 中, 如果某个高斯的平均梯度 > 阈值 τ_L,
+        #       说明该位置欠拟合, 需要在相应层级新增锚点
+        #
+        # 难点: 梯度 grad 的索引空间是 [M] (有效且被渲染的高斯),
+        #       但 offset_gradient_accum 的索引空间是 [N*k] (所有偏移位置),
+        #       因此需要构建 combined_mask 来做映射:
+        #       combined_mask[i] = True 表示全局偏移位置 i 对应一个 "既是有效高斯, 又实际被渲染" 的高斯基元
+
+        # --- 构建 combined_mask: 两步筛选 ---
+        # Step 4a: 将 anchor_visible_mask 从 [N] 展开为 [N*k]
+        #   每个锚点所管辖的 k 个Gaussian基元都继承该锚点的可见性
+        anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
+
+        # Step 4b: 初始化全零的 combined_mask [N*k]
         combined_mask = torch.zeros_like(self.offset_gradient_accum, dtype=torch.bool).squeeze(dim=1)
-        combined_mask[anchor_visible_mask] = offset_selection_mask  # 先标记"有效高斯"的位置
+
+        # Step 4c: 第一步筛选 — 标记"有效高斯"
+        #   在可见锚点对应的偏移位置中, 标记 offset_selection_mask(MLP预测Opacity>0的GS基元Mask)为True的位置
+        #   anchor_visible_mask: [N*k] bool,该Gaussian对应的Anchor是否可见
+        #   offset_selection_mask: [N*k] bool,该Gaussian是否有效(MLP预测的Opacity>0)  ===> 只有Anchor点可见+Opacity>0的Gaussian才会被累积梯度
+        combined_mask[anchor_visible_mask] = offset_selection_mask
+
+        # Step 4d: 第二步筛选 — 从有效高斯中再筛选"实际被渲染"的
+        #   虽然Gaussian对应的Anchor点有效+Opacity>0,但Gaussian可能对该帧图像渲染的贡献很小(radii=0)或者不参与渲染,需筛选
+        #   update_filter[i]=False的高斯虽然有效但没被光栅化(radii=0), 排除掉
+        #   最终 combined_mask中True的数量 = 实际被渲染的高斯数M'(update_filter为True的数量)
         temp_mask = combined_mask.clone()
-        combined_mask[temp_mask] = update_filter  # 再从中筛选"实际被渲染"的
+        combined_mask[temp_mask] = update_filter
         
-        # 计算屏幕空间梯度范数 (缩放到像素坐标)
-        grad = viewspace_point_tensor.grad.squeeze(0)  # [M, 2] 屏幕空间坐标梯度
-        grad[:, 0] *= width * 0.5    # NDC → 像素坐标缩放
+        # --- 计算梯度范数并累积 ---
+        # viewspace_point_tensor.grad: [1, M, 2] — 损失对2D屏幕空间坐标的梯度
+        # 这个梯度是 loss.backward() 自动计算的, 因为 means2d 调用了 retain_grad()
+        grad = viewspace_point_tensor.grad.squeeze(0)  # [M, 2]
+
+        # NDC坐标 → 像素坐标的缩放
+        # NDC范围大约 [-1, 1], 乘以 width/2 和 height/2 转换为像素单位
+        # 这样不同分辨率的图像产生的梯度具有可比性
+        grad[:, 0] *= width * 0.5
         grad[:, 1] *= height * 0.5
-        grad_norm = torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)  # [M', 1]
-        self.offset_gradient_accum[combined_mask] += grad_norm  # 累积梯度范数
-        self.offset_denom[combined_mask] += 1                    # 累积计数
+
+        # 只取实际被渲染的高斯(update_filter)的梯度, 计算L2范数
+        # grad_norm: [M', 1] — 每个被渲染高斯的屏幕空间梯度范数
+        grad_norm = torch.norm(grad[update_filter, :2], dim=-1, keepdim=True)
+
+        # 通过 combined_mask 将梯度范数累积到全局偏移位置数组中
+        # 后续 anchor_growing() 会用 offset_gradient_accum / offset_denom
+        # 计算每个偏移位置的平均梯度, 与阈值 τ_L 比较来决定是否生长
+        self.offset_gradient_accum[combined_mask] += grad_norm
+        self.offset_denom[combined_mask] += 1
         
     # ==========================================================================
     # 优化器剪枝 — 从Adam优化器中移除被删除的锚点
@@ -366,7 +454,7 @@ class BasicModel:
             matches = (selected_grid_coords_unique.unsqueeze(1) == grid_coords.unsqueeze(0)).all(-1)
             counts = matches.sum(dim=1)
 
-        remove_duplicates = counts >= num_overlap  # 匹配数 >= 阈值(默认为1) → 标记为重复
+        remove_duplicates = counts >= num_overlap  # 匹配数 >= 阈值 → 标记为重复
 
         return remove_duplicates
     

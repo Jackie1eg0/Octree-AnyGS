@@ -24,7 +24,9 @@ from plyfile import PlyData, PlyElement
 from utils.graphics_utils import BasicPointCloud
 from scene.embedding import Embedding
 from scene.basic_model import BasicModel
-    
+
+# =========================== base_model.py是 Scaffold-GS(单层)==============================
+# 而lod_model.py是 Octree-GS(多层)(两者相互独立实现,共享basic_model.py中的工具函数)
 class GaussianModel(BasicModel):
 
     def __init__(self, **model_kwargs):
