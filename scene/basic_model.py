@@ -218,9 +218,9 @@ class BasicModel:
                 scaling:           [M, 3] 每个Gaussian的缩放参数(假设Gaussian基元个数为M个)
                 viewspace_points:  [1, M, 2] 每个Gaussian在屏幕空间的2D坐标(means2d),带梯度,是致密化统计的核心
                 visibility_filter: [M] bool, 在该帧图片中实际被光栅化渲染的Gaussian Mask(真正对最终像素有贡献的Gaussian基元)
-                visible_mask:      [N] bool, 可见锚点掩码两层筛选 (LOD等级筛选仅仅保留level<=floor(L*)的Anchor+来自prefilter_voxel视锥剔除)
-                selection_mask:    [N*k] bool, 有效的高斯基元掩码 (opacity>0,MLP预测GS属性的时候,可以通过Opacity<=0来动态调整Anchor周围实际管辖的有效GS个数)
-                opacity:           [M, 1] 每个Gaussian基元的不透明度值(Opacity)
+                visible_mask:      [N] bool, Anchor级别:可见锚点掩码两层筛选 (LOD等级筛选仅仅保留level<=floor(L*)的Anchor+来自prefilter_voxel视锥剔除)
+                selection_mask:    [N*k] bool, Gaussian级别:有效的高斯基元掩码 (opacity>0,MLP预测GS属性的时候,可以通过Opacity<=0来动态调整Anchor周围实际管辖的有效GS个数)
+                opacity:           [M, 1] Gaussian级别:每个Gaussian基元的不透明度值(Opacity)
             width:  渲染图像宽度 (用于梯度缩放)
             height: 渲染图像高度 (用于梯度缩放)
         
@@ -229,7 +229,8 @@ class BasicModel:
         #   
         #   Step1(Anchor点LOD级别筛选): 第一层筛选(_anchor_mask LOD层级筛选): 该帧Image具有相机的位姿(包含相机坐标+相机朝向),Anchor点的位置可知(不同LOD层级的Anchor点位置可确定) ==> 可用Anchor到相机中心距离计算LOD层级L*,将L*映射为离散整数(round/progressive)
         #          筛选条件: anchor_level <= int_level 只要LOD层级<=该相机可见的最大LOD层级,就留下,因为相机可观察到这些层级
-        #   
+        #          从每个Anchor点出发(每个Anchor在增加的时候其LOD层级是确定的,位置确定的),计算每个Anchor点到所有相机中心的欧式距离,全量一次性计算,再确定该相机所见的最大LOD层级,满足anchor_level<=int_level的Anchor才会被保留
+        #          
         #   Step2(Anchor点视锥剔除): 第二层筛选(visible_mask Anchor级别的视锥剔除Frustum Culling ), 经过第一层剔出的Gaussian仅满足其所属Anchor的LOD层级<=该相机到Anchor最大可见层级,但是Anchor可能不在相机视锥以内
         #          视锥之外的Anchor对该帧的渲染起不到任何作用,其经过Splat不会在屏幕留下痕迹,因此可以做视锥剔除
         #   疑难区分:视锥体的剔除逻辑:是Anchor(有Scaling前三维参数,可以视为一个粗粒度的3DGS)经过Splat到2D屏幕看是否有投影的2D Gaussian Or 从屏幕出发根据相机内存+外参构建3D视锥体,看Anchor点是否在视锥体内
@@ -251,7 +252,14 @@ class BasicModel:
         #   着色阶段:Tile-Based Rasterization,将屏幕分成多个Tile,深度排序,逐像素着色,每个Tile独立着色,可以并行处理
         #   
         #   Step5(Anchor累积Opacity):Step1+2+3筛选后的Gaussian(不包含Step4光栅化剔除的Gaussian):为判断Anchor是否需要剪枝,即使GS没有被光栅化渲染(radii=0),但只要MLP认为其有效Opacity>0,就说明这个Anchor还在做渲染贡献
-        #        (Anchor梯度累积):用的是Step1+2+3+4筛选后的Gaussian,判断Anchor是否需要增长,只有真正参与Pixel着色的Gaussian才有有效梯度,必须经过Step4光栅化
+        #        (Anchor梯度累积):用的是Step1+2+3+4筛选后的Gaussian,判断Anchor是否需要增长,只有真正参与Pixel着色的Gaussian才有有效2D屏幕梯度,必须经过Step4光栅化
+        
+        
+        # Q:渲染损失Loss反向传播 ==> 2D Gaussian位置梯度
+        # L1_loss计算Render出来的像素与真实拍摄的像素差异,渲染出的Pixel颜色是根据α-Blending公式计算的,GS的颜色*GS的不透明度*累积的透光率
+        #                  Loss → C(p) → αᵢ → G(p, μᵢ, Σᵢ) → μᵢ²ᴰ ✅ 
+        #                  而Render出来的像素颜色C_p在α-Blending公式中受到GS的Opacity的影响
+        #                  Opacity是根据该Pixel到2D Gaussian的距离决定的(GS本身不透明度*2D高斯概率)
         """
         # =====================================================================
         # Step 1: 从 render_pkg 字典中提取本帧渲染的关键结果
@@ -281,7 +289,7 @@ class BasicModel:
         # opacity: [M, 1] — 每个高斯基元的不透明度值 (经sigmoid激活后)
         
         # =====================================================================
-        # Step 2: 累积每个锚点的不透明度总和 → self.opacity_accum
+        # Step 2: 累积每个锚点的不透明度总和(Step1+Step2+Step3筛选) → self.opacity_accum
         # =====================================================================
         # 用途: prune_anchor() 中, 如果 opacity_accum / anchor_demon < min_opacity,
         #       说明该锚点长期贡献很低, 会被剪枝删除
@@ -310,12 +318,12 @@ class BasicModel:
         self.anchor_demon[anchor_visible_mask] += 1 # 在该帧可见的Anchor点统计次数+1
 
         # =====================================================================
-        # Step 4: 累积屏幕空间梯度范数 → self.offset_gradient_accum
+        # Step 4: Anchor累积2D GS屏幕空间梯度范数 → self.offset_gradient_accum
         # =====================================================================
         # 用途: anchor_growing() 中, 如果某个高斯的平均梯度 > 阈值 τ_L,
         #       说明该位置欠拟合, 需要在相应层级新增锚点
         #
-        # 难点: 梯度 grad 的索引空间是 [M] (有效且被渲染的高斯),
+        # 难点: 梯度 grad 的索引空间是 [M] (有效且被光栅化渲染的高斯),
         #       但 offset_gradient_accum 的索引空间是 [N*k] (所有偏移位置),
         #       因此需要构建 combined_mask 来做映射:
         #       combined_mask[i] = True 表示全局偏移位置 i 对应一个 "既是有效高斯, 又实际被渲染" 的高斯基元
@@ -328,13 +336,13 @@ class BasicModel:
         # Step 4b: 初始化全零的 combined_mask [N*k]
         combined_mask = torch.zeros_like(self.offset_gradient_accum, dtype=torch.bool).squeeze(dim=1)
 
-        # Step 4c: 第一步筛选 — 标记"有效高斯"
+        # Step 4c: 第一步筛选 — 标记"有效高斯"(MLP预测的Opacity>0的GS)
         #   在可见锚点对应的偏移位置中, 标记 offset_selection_mask(MLP预测Opacity>0的GS基元Mask)为True的位置
         #   anchor_visible_mask: [N*k] bool,该Gaussian对应的Anchor是否可见
         #   offset_selection_mask: [N*k] bool,该Gaussian是否有效(MLP预测的Opacity>0)  ===> 只有Anchor点可见+Opacity>0的Gaussian才会被累积梯度
         combined_mask[anchor_visible_mask] = offset_selection_mask
 
-        # Step 4d: 第二步筛选 — 从有效高斯中再筛选"实际被渲染"的
+        # Step 4d: 第二步筛选 — 从有效高斯中再筛选"实际被光栅化渲染"的GS
         #   虽然Gaussian对应的Anchor点有效+Opacity>0,但Gaussian可能对该帧图像渲染的贡献很小(radii=0)或者不参与渲染,需筛选
         #   update_filter[i]=False的高斯虽然有效但没被光栅化(radii=0), 排除掉
         #   最终 combined_mask中True的数量 = 实际被渲染的高斯数M'(update_filter为True的数量)
@@ -352,15 +360,15 @@ class BasicModel:
         grad[:, 0] *= width * 0.5
         grad[:, 1] *= height * 0.5
 
-        # 只取实际被渲染的高斯(update_filter)的梯度, 计算L2范数
+        # 只取实际被光栅化渲染的GS的梯度, 计算L2范数
         # grad_norm: [M', 1] — 每个被渲染高斯的屏幕空间梯度范数
         grad_norm = torch.norm(grad[update_filter, :2], dim=-1, keepdim=True)
 
         # 通过 combined_mask 将梯度范数累积到全局偏移位置数组中
         # 后续 anchor_growing() 会用 offset_gradient_accum / offset_denom
         # 计算每个偏移位置的平均梯度, 与阈值 τ_L 比较来决定是否生长
-        self.offset_gradient_accum[combined_mask] += grad_norm
-        self.offset_denom[combined_mask] += 1
+        self.offset_gradient_accum[combined_mask] += grad_norm  # 记录每个Gaussian在过去多少帧中的位置梯度总和(只有在光栅化渲染时候才进行该GS位置梯度累加)
+        self.offset_denom[combined_mask] += 1                   # 记录GS在多少帧中被光栅化渲染(GS被光栅化渲染的次数)
         
     # ==========================================================================
     # 优化器剪枝 — 从Adam优化器中移除被删除的锚点
