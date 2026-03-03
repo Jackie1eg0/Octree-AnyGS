@@ -12,8 +12,8 @@
 """
 scene/dataset_readers.py — 场景数据读取器
 
-本文件负责从不同格式的数据集中读取相机参数、图像和初始点云, 
-将其统一封装为 SceneInfo 结构供 Scene 类使用。
+本文件负责从不同格式的数据(如colmap、blender、city)中读取相机参数、图像和初始点云, 
+并将数据统一封装为 SceneInfo 结构供 Scene 类使用。
 
 支持三种数据格式:
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -76,7 +76,7 @@ class CameraInfo(NamedTuple):
         uid:        int,      相机唯一ID
         R:          [3, 3],   旋转矩阵 (W2C的旋转部分的转置, 注意是转置存储!)
                               实际 W2C 旋转 = R.T, 这是CUDA代码中glm库的约定
-        T:          [3],      平移向量 (W2C的平移部分)
+        T:          [3],      平移向量 (W2C的平移部分)  ===> 具有R和T可以构建W2C矩阵
         FovY:       float,    垂直视场角 (弧度)
         FovX:       float,    水平视场角 (弧度)
         image:      PIL.Image, 原始图像 (CPU, 尚未转为Tensor)
@@ -103,7 +103,7 @@ class SceneInfo(NamedTuple):
         point_cloud:       BasicPointCloud, 初始SfM点云 (points[M,3], colors[M,3], normals[M,3])
         train_cameras:     [CameraInfo], 训练相机列表
         test_cameras:      [CameraInfo], 测试相机列表
-        nerf_normalization: dict, 场景归一化参数:
+        nerf_normalization: dict, 场景归一化参数(getNerfppNorm函数计算出nerf_normalization字典):
                             - "translate": [3], 场景中心的平移向量 (将相机中心移到原点)
                             - "radius":    float, 场景半径 (所有相机到中心的最大距离 × 1.1)
         ply_path:          str, 点云PLY文件路径
@@ -121,8 +121,13 @@ class SceneInfo(NamedTuple):
 
 def getNerfppNorm(cam_info):
     """计算 NeRF++ 风格的场景归一化参数。
-    
     根据所有训练相机的世界坐标, 计算场景中心和半径。
+    
+    ===================== 3DGS借用NerF++的归一化方式=====================
+    但是没有任何地方把translate应用到点云坐标或相机位置来做居中,也没有用radius除坐标做缩放
+    仅仅使用其中的radius作为场景尺度度量,用于自适应调整学习率,没有真正对场景坐标归一化变换
+    ========================================================================
+
     用于:
       1. Scene.cameras_extent → spatial_lr_scale (位置学习率缩放)
       2. 大场景下的坐标归一化
@@ -142,7 +147,7 @@ def getNerfppNorm(cam_info):
             "radius":    float, 场景半径 (cameras_extent)
     """
     def get_center_and_diag(cam_centers):
-        """内部辅助: 计算相机中心的均值和最大离散距离。
+        """内部辅助: 计算所有Camera中心的平均值和最大离散距离(平均中心到最远Camera的距离)
         
         参数:
             cam_centers: list of [3, 1] ndarray, 每个相机的世界坐标
@@ -152,10 +157,10 @@ def getNerfppNorm(cam_info):
             diagonal: float, 某个相机到中心的最大距离
         """
         cam_centers = np.hstack(cam_centers)                    # [3, N] 拼接所有相机中心
-        avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)  # [3, 1] 平均中心
+        avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)  # [3, 1] 得到所有相机中心的平均值
         center = avg_cam_center
-        dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)  # [1, N] 每个相机到中心的距离
-        diagonal = np.max(dist)                                 # 最大距离
+        dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)  # [1, N] 每个相机到平均中心的距离
+        diagonal = np.max(dist)                                 # 最大距离(最远Camera到平均中心的距离)
         return center.flatten(), diagonal
 
     cam_centers = []
@@ -163,12 +168,12 @@ def getNerfppNorm(cam_info):
     for cam in cam_info:
         W2C = getWorld2View2(cam.R, cam.T)      # [4, 4] W2C矩阵 (从R的转置和T恢复)
         C2W = np.linalg.inv(W2C)                # [4, 4] C2W矩阵 = W2C的逆
-        cam_centers.append(C2W[:3, 3:4])        # [3, 1] 相机世界坐标 = C2W的平移列
+        cam_centers.append(C2W[:3, 3:4])        # [3, 1] Camera世界坐标 = C2W的平移列
 
-    center, diagonal = get_center_and_diag(cam_centers)
+    center, diagonal = get_center_and_diag(cam_centers) # 得到所有Camera在世界坐标下的平均中心和最大离散距离(平均中心到最远Camera的距离)
     radius = diagonal * 1.1                     # 留 10% 余量
 
-    translate = -center                         # 平移向量: 将场景中心移到原点
+    translate = -center                         # 平移向量: 将所有Camera的平均中心移到原点
 
     return {"translate": translate, "radius": radius}
 
@@ -256,9 +261,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
     
     def process_frame(idx, key):
-        """处理单个相机帧: 解析内外参 + 加载图像。"""
-        extr = cam_extrinsics[key]
-        intr = cam_intrinsics[extr.camera_id]
+        """处理单个相机帧: 提取相机内外参 + 加载图像。"""
+        extr = cam_extrinsics[key]              # 相机位姿
+        intr = cam_intrinsics[extr.camera_id]   # 相机内参
         height = intr.height
         width = intr.width
 
@@ -267,7 +272,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        # 根据相机模型计算视场角 (FoV)
+        # 根据相机模型计算视场角 (FoV)---在3DGS中具有核心作用:构建透视投影矩阵(Project Matrix),决定相机能看到多大角度范围+视锥裁剪
         if intr.model=="SIMPLE_PINHOLE" or intr.model == "SIMPLE_RADIAL":
             # 单焦距模型: fx = fy = params[0]
             focal_length_x = intr.params[0]
@@ -285,11 +290,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
-
+        
+        # CameraInfo 包含了相机位姿、内参、视场角、图像路径、图像名称、图像尺寸(所存即所得)
         return CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
 
     # 使用线程池并行加载图像 (I/O密集型, 线程池比进程池更合适)
+    # 多线程并行加载所有相机图像
     ct = 0
     progress_bar = tqdm(cam_extrinsics, desc="Loading dataset")
 
@@ -307,7 +314,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         progress_bar.close()
 
-    # 按图像名排序, 确保顺序一致性 (多线程完成顺序不确定)
+    # 按图像名排序,Mip-NERF的images一般都带编号, 确保顺序一致性 (多线程完成顺序不确定)
     cam_infos = sorted(cam_infos, key = lambda x : x.image_name)
     return cam_infos
 
@@ -466,7 +473,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, warmup_ply_path=None):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    # 读取所有相机信息 (外参+内参 → CameraInfo 列表)
+    # 读取Colmap输出所有相机信息 (外参+内参 → CameraInfo 列表)
     reading_dir = images
     cam_infos = readColmapCameras(cam_extrinsics, cam_intrinsics, os.path.join(path, reading_dir))
     
@@ -504,6 +511,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, warmup_ply_path=None):
         pcd = fetchPly(ply_path)
 
     # 封装为 SceneInfo 返回
+    # 点云pcd 训练的相机视图 train_cameras 测试的相机视图 test_cameras 归一化参数 nerf_normalization ply文件路径
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
@@ -513,7 +521,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, warmup_ply_path=None):
 
 
 # =============================================================================
-# 场景读取入口 — Blender/NeRF Synthetic 格式
+# 场景读取入口 — Blender/NeRF Synthetic 格式(用Colmap不用看)
 # =============================================================================
 
 def readNerfSyntheticInfo(path, eval, extension=".png", warmup_ply_path=None):
@@ -586,7 +594,7 @@ def readNerfSyntheticInfo(path, eval, extension=".png", warmup_ply_path=None):
 
 
 # =============================================================================
-# 场景读取入口 — City 大场景格式
+# 场景读取入口 — City 大场景格式(用Colmap不用看)
 # =============================================================================
 
 def readCityInfo(path, eval, llffhold=8, extension=".png", warmup_ply_path=None):

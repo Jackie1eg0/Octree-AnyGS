@@ -109,8 +109,8 @@ def render(viewpoint_camera, pc, pipe, bg_color, iteration, render_mode, ape_cod
     # =========================================================================
     # 输入: visible_mask (可见Anchor), ape_code (外观嵌入索引)
     # 过程: 提取可见Anchor的特征 → 计算相机到Anchor方向 → MLP解码颜色/opacity/协方差
-    #       selection_mask 标记了Opacity>0的有效Gaussian (MLP可以动态关闭某些GS)
-    # 输出: xyz[M,3], color[M,3], opacity[M,1], scaling[M,3], rot[M,4]
+    #       selection_mask 标记了Opacity>0的有效Gaussian (MLP可以动态关闭某些GS,动态分配每个Anchor管辖的有效GS数量)
+    # 输出: xyz[M,3], color[M,3], opacity[M,1], scaling[M,3], rot[M,4], sh_degree[M,1]
     #        M = selection_mask中True的数量 (有效Neural Gaussian数)
     xyz, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_neural_gaussians(viewpoint_camera, visible_mask, ape_code)
     
@@ -209,9 +209,11 @@ def prefilter_voxel(viewpoint_camera, pc, pipe, bg_color):
     注意: 输入已经过 _anchor_mask 筛选(LOD层级过滤), 本函数在此基础上进一步做视锥剔除。
     输出的 visible_mask 同时编码了两层筛选的结果。
     
+    =========================================================================================
     为什么不直接对所有Gaussian做视锥剔除?
       因为每个Anchor管辖k个Gaussian, 如果Anchor本身不在视锥内, 其管辖的GS大概率也不在,
       先剔除Anchor可以大幅减少后续MLP推理的计算量 (避免对不可见Anchor做MLP解码)。
+    =========================================================================================
     
     参数:
         viewpoint_camera: Camera对象, 包含相机内外参和图像尺寸
@@ -241,7 +243,7 @@ def prefilter_voxel(viewpoint_camera, pc, pipe, bg_color):
     viewmats = viewpoint_camera.world_view_transform.transpose(0, 1)[None]  # [1, 4, 4] W2C矩阵
 
     N = means.shape[0]      # LOD可见的Anchor数量
-    C = viewmats.shape[0]   # 相机数量 (这里固定为1)
+    C = viewmats.shape[0]   # 相机数量(这里固定为1)
     device = means.device
     assert means.shape == (N, 3), means.shape
     assert quats.shape == (N, 4), quats.shape
@@ -253,6 +255,15 @@ def prefilter_voxel(viewpoint_camera, pc, pipe, bg_color):
     # 核心输出是 radii: 每个Anchor在屏幕上的投影半径
     #   radii > 0 → 该Anchor的椭球投影到屏幕上有覆盖面积 → 可见
     #   radii = 0 → 不在屏幕内/深度在近远平面外/投影面积为0 → 不可见
+
+    # =========================== gsplat库中fully_fused_projection函数解释============
+    # 1)进行坐标系转换,世界坐标系 ==> 相机坐标系 使用W2C矩阵 depth<near_plane 剔除,depth>far_plane 剔除
+    # 2)构建3D Gaussian的协方差矩阵Σ Σ是由R S矩阵构建的半正定矩阵,而R一般由旋转四元数存储,S由缩放向量存储
+    # 3)3D Gaussian ==> 2D Gaussian Σ为3D 协方差矩阵【3*3】 W W2C矩阵 J 透视投影的Jacobian矩阵 
+    #   Q: 为什么不用透视投影矩阵? 透视投影是非线性的(除以 z），不能直接对协方差做变换。EWA 的核心思想是用 Jacobian 做一阶泰勒展开, 在高斯中心附近用线性变换来近似透视投影
+    # 4)计算radii(投影半径):经过3)可得到Σ_2D协方差矩阵,从2D Gaussian协方差矩阵的特征值计算椭圆的最大半径(取99.7%的置信空间 3σ)
+    # 5)radii>0 → 该Anchor的椭球投影到屏幕上有覆盖面积 → 可见 => 该GS能对image中的像素做贡献
+    #   radii=0 → 不在屏幕内/深度在近远平面外/投影面积为0 → 不可见
     proj_results = fully_fused_projection(
         means,
         None,       # covars: 不预计算协方差,直接用quats+scales更快
@@ -272,20 +283,27 @@ def prefilter_voxel(viewpoint_camera, pc, pipe, bg_color):
     )
     
     # 解析投影结果: radii [C, N] = [1, N']
+    # 投影结果参数含义解析:
+    # 1)radii 每个Anchor在屏幕上的投影半径,radii>0 → 可见(使用3σ原则)
+    # -------------- 以下参数未使用 -------------------------------
+    # 2)means2d 每个Anchor在屏幕上的投影中心,2D 像素坐标(u,v)
+    # 3)depths 每个Anchor在相机坐标系下的深度值z,距离相机有多远
+    # 4)conics 每个Anchor在屏幕上的投影2D协方差Σ_2D逆矩阵,在光栅化时用于计算每个像素 p 到高斯中心 μ 的马氏距离,从而计算该GS对该像素贡献权重
+    # 5)compensations 每个Anchor在屏幕上的投影补偿
     radii, means2d, depths, conics, compensations = proj_results
     camera_ids, gaussian_ids = None, None
     
     # 构建最终 visible_mask [N] — 在 _anchor_mask 基础上叠加视锥剔除结果
     # 初始化: 复制 _anchor_mask (LOD筛选结果)
     # 然后在 _anchor_mask=True 的位置,用 radii>0 进一步过滤
-    visible_mask = pc._anchor_mask.clone()                      # [N] bool, 从LOD筛选结果开始
+    visible_mask = pc._anchor_mask.clone()                     # [N] bool, 从LOD筛选结果开始
     visible_mask[pc._anchor_mask] = radii.squeeze(0) > 0       # LOD通过的Anchor中, radii>0的才保留
     
     return visible_mask
 
 
 # =============================================================================
-# 2DGS 渲染主函数
+# 2DGS 渲染主函数(不用管)
 # =============================================================================
 def render_2dgs(viewpoint_camera, pc, pipe, bg_color, iteration, render_mode):
     """2D Gaussian Splatting 渲染主函数。流程与 render() 基本一致。
@@ -400,7 +418,7 @@ def render_2dgs(viewpoint_camera, pc, pipe, bg_color, iteration, render_mode):
 
 
 # =============================================================================
-# 2DGS Anchor级视锥剔除
+# 2DGS Anchor级视锥剔除(不用管)
 # =============================================================================
 def prefilter_voxel_2dgs(viewpoint_camera, pc, pipe, bg_color):
     """Anchor级视锥剔除 (2DGS版)。

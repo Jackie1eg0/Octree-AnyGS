@@ -84,7 +84,7 @@ class Scene:
                 - eval:              bool, 是否划分训练/测试集
                 - white_background:  bool, 是否使用白色背景
                 - random_background: bool, 是否使用随机背景
-                - ratio:             int, 点云降采样比例 (每ratio个点取1个)
+                - ratio:             int, 点云降采样比例 (每ratio个点取1个,默认1全采样)
             gaussians:         GaussianLoDModel (Octree-GS) 或 GaussianModel (Scaffold-GS)
                                高斯模型对象, 此时尚未初始化参数
             load_iteration:    int 或 None, 从哪个checkpoint恢复:
@@ -126,6 +126,38 @@ class Scene:
                 
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
+        # train_cameras / test_cameras 存储格式:
+        #   dict: {resolution_scale: [Camera, Camera, ...]}
+        #   key   = float, 分辨率缩放因子 (如 1.0)
+        #   value = list of Camera (nn.Module), 每个 Camera 对象包含:
+        #     ─── 基本信息 ───
+        #       uid:                  int,              相机顺序编号
+        #       colmap_id:            int,              原始 CameraInfo 的 uid
+        #       image_name:           str,              图像名称 (不含扩展名)
+        #       resolution_scale:     float,            分辨率缩放因子
+        #     ─── 内外参 ───
+        #       R:                    [3,3] ndarray,    旋转矩阵 (W2C旋转的转置, CUDA glm约定)
+        #       T:                    [3] ndarray,      平移向量 (W2C的平移部分)
+        #       FoVx:                 float,            水平视场角 (弧度)
+        #       FoVy:                 float,            垂直视场角 (弧度)
+        #     ─── 图像数据 ───
+        #       original_image:       [3, H, W] CUDA Tensor, GT图像 (已缩放, clamp到[0,1])
+        #       image_width:          int,              缩放后的图像宽度
+        #       image_height:         int,              缩放后的图像高度
+        #     ─── 裁剪面 ───
+        #       znear:                float,            近裁剪面 = 0.01
+        #       zfar:                 float,            远裁剪面 = 100.0
+        #     ─── 预计算的变换矩阵 (CUDA Tensor) ───
+        #       world_view_transform: [4,4],            W2C矩阵 (列主序转置存储)
+        #       projection_matrix:    [4,4],            透视投影矩阵
+        #       full_proj_transform:  [4,4],            完整MVP矩阵 = W2C × Projection
+        #       camera_center:        [3],              相机在世界坐标系中的位置
+        #
+        # train_cameras 与 test_cameras 结构完全相同, 区别仅在数据来源:
+        #   COLMAP:  LLFF协议, 每llffhold(=8)张取1张做测试, 其余训练
+        #   Blender: transforms_train.json → 训练, transforms_test.json → 测试
+        #   City:    同COLMAP的LLFF协议划分
+        #   eval=False 时, 所有相机归入训练集, 测试集为空列表
         self.train_cameras = {}     # {scale: [Camera]}
         self.test_cameras = {}      # {scale: [Camera]}
         
@@ -139,9 +171,9 @@ class Scene:
         #
         # 返回的 scene_info (SceneInfo 命名元组) 包含:
         #   - point_cloud:       BasicPointCloud (SfM点云: points, colors, normals)
-        #   - train_cameras:     [CameraInfo] 训练相机信息列表
+        #   - train_cameras:     [CameraInfo] 训练相机信息列表,所含的信息格式如上注释
         #   - test_cameras:      [CameraInfo] 测试相机信息列表
-        #   - nerf_normalization: dict, {"translate": [3], "radius": float} 场景归一化参数
+        #   - nerf_normalization: dict, {"translate": [3], "radius": float} 场景归一化参数,自适应不同尺度的场景
         #   - ply_path:          str, 原始PLY点云路径
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, warmup_ply_path=ply_path)
@@ -168,6 +200,7 @@ class Scene:
             pcd = self.save_ply(scene_info.point_cloud, args.ratio, os.path.join(self.model_path, "input.ply"))
             
             # 5b. 导出所有相机参数为 cameras.json (用于可视化和调试)
+            # 导出为JSON格式,包含camera_id img_name width height(图像的W H) position(相机在World坐标系下的位置) rotation(相机的旋转矩阵) fx fy(焦距)
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
@@ -215,13 +248,13 @@ class Scene:
         else:
             # 7a. 首次训练: 从降采样后的SfM点云创建八叉树高斯模型
             # create_from_pcd() 内部流程:
-            #   1) set_level()     → 计算 d_max, LOD层数K
-            #   2) octree_sample() → 多层体素化, 构建八叉树
-            #   3) weed_out()      → 可见性裁剪
+            #   1) set_level()     → 根据SFM点云和相机位置计算 d_max, 确定Octree的最大LOD层数K上限
+            #   2) octree_sample() → 多层体素化, 构建八叉树,初始化时用同一批的SFM点云在不同层级的Voxel中心构建
+            #   3) weed_out()      → 可见性裁剪,初始化生成的不同层级的Anchor点可能冗余,确保大概90%的相机能见到这个Anchor点才保留,剔除的主要是高层级+稀疏相机覆盖区域Anchor点
             #   4) 初始化所有可学习参数 (anchor/offset/feat/scaling/rotation)
             #
             # 这里传入 self.train_cameras 和 self.resolution_scales,
-            # 用于 set_level() 计算相机-点云距离来确定LOD层数
+            # 用于 set_level() 计算相机-点云距离来确定LOD层数,构建Octree
             self.gaussians.create_from_pcd(pcd, self.cameras_extent, logger, self.train_cameras, self.resolution_scales)
 
     def save_ply(self, pcd, ratio, path):
@@ -271,7 +304,7 @@ class Scene:
         在 train.py 的主循环中用于随机采样训练视角。
         
         返回:
-            [Camera] 所有训练相机的列表
+            [Camera] 所有训练相机的列表每个Camera对象包含的信息包括 1)基本信息 2)内外参 3)图像数据 4)裁剪平面
         """
         all_cams = []   
         for scale in self.resolution_scales:
