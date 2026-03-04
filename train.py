@@ -548,12 +548,13 @@ def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False
         gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])  # 创建新的空模型
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, resolution_scales=dataset.resolution_scales)  # 加载checkpoint权重
         gaussians.eval()               # 切换到eval模式(MLP关闭dropout等)
-        gaussians.set_coarse_interval(opt)  # 设置LOD渐进训练时间表(渲染时需要知道coarse_intervals来正确处理LOD)
+        gaussians.set_coarse_interval(opt)  # 设置LOD渐进训练时间表(coarse_intervals会决定只渲染已解锁的层级，避免渲染尚未训练的层,一般训练结束后所有LOD层都解锁)
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
 
-        # ---------- 渲染训练集 ----------
+        # ---------- 渲染训练集(render_sets()渲染+FPS计算) ----------
         if not skip_train:
+            # 根据相机位姿(位置+朝向+内参) ==> 3DGS会渲染出图像,并计算该视角下参与渲染的GS数量以及渲染耗时以计算FPS(FPS = 1/平均渲染耗时)
             t_train_list, visible_count = render_set(dataset.base_model, dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipe, scene.background, dataset.render_mode)
             # 计算FPS: 跳过前5帧(GPU预热,首次渲染会触发CUDA kernel编译,耗时偏高)
             train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
@@ -563,7 +564,7 @@ def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False
             if wandb is not None:
                 wandb.log({"train_fps":train_fps.item(), })
 
-        # ---------- 渲染测试集 ----------
+        # ---------- 渲染测试集(与训练集渲染同理) ----------
         if not skip_test:
             t_test_list, visible_count = render_set(dataset.base_model, dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipe, scene.background, dataset.render_mode)
             # 同样跳过前5帧计算FPS
@@ -574,19 +575,23 @@ def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False
             if wandb is not None:
                 wandb.log({"test_fps":test_fps, })
     
-    return visible_count  # 返回最后一组(test/train)的可见GS数量列表
+    # 返回最后一组(test/train)的可见GS数量列表
+    # visible_count是一个list,每个元素是单个视角下的可见GS数量,不是平均值
+    # 比如我有N张图片,就有N个相机位姿,进行N个视角的渲染,得到N个可见GS数量的列表
+    return visible_count  
 
-
+#   把render_set()之前保存到磁盘的PNG图片重新读回GPU Tensor中,用于计算PSNR/SSIM/LPIPS等指标
 def readImages(renders_dir, gt_dir):
     renders = []
     gts = []
     image_names = []
-    for fname in os.listdir(renders_dir):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        image_names.append(fname)
+    # 遍历renders_dir目录下的所有PNG文件
+    for fname in os.listdir(renders_dir):   
+        render = Image.open(renders_dir / fname)    # 用PIL打开渲染图 (H,W,3)
+        gt = Image.open(gt_dir / fname)             # 用PIL打开GT图 (H,W,3)
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())  # 将渲染图转换为GPU Tensor (1,3,H,W)
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())          # 将GT图转换为GPU Tensor (1,3,H,W)
+        image_names.append(fname)                   # 记录文件名
     return renders, gts, image_names
 
 
@@ -595,8 +600,8 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
     结果保存到 results.json 和 per_view.json。
     """
 
-    full_dict = {}
-    per_view_dict = {}
+    full_dict = {}              # 存整个场景重建性能的平均指标,写入results.json
+    per_view_dict = {}          # 存每个视角的重建性能指标,写入per_view.json
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
     
@@ -606,7 +611,7 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
     full_dict_polytopeonly[scene_dir] = {}
     per_view_dict_polytopeonly[scene_dir] = {}
 
-    test_dir = Path(scene_dir) / eval_name
+    test_dir = Path(scene_dir) / eval_name  # 定位渲染结果目录+读取图片(L614-626),如outputs/.../test/
 
     for method in os.listdir(test_dir):
 
@@ -618,17 +623,24 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
         method_dir = test_dir / method
         gt_dir = method_dir/ "gt"
         renders_dir = method_dir / "renders"
-        renders, gts, image_names = readImages(renders_dir, gt_dir)
+        renders, gts, image_names = readImages(renders_dir, gt_dir)  # 读取渲染图和GT图 ====> renders:N个[1,3,H,W], gts:N个[1,3,H,W]
 
+        # 评估三维重建质量的性能指标:
+        #   3D重建效果的好坏,关键看给定一个模型未见过的相机位姿,其渲染出来的图片与GT图是否接近
+        #   Dataset通常是真实世界拍摄的一组图片,根据Colmap去估计相机位姿,重建点云,划分训练集和测试集
+        #   用训练集的相机位姿进行场景重建,优化GS分布以及属性
+        #   用测试集的相机位姿进行场景渲染,得到测试集的渲染图和GT图,然后计算PSNR,SSIM,LPIPS等指标
         ssims = []
         psnrs = []
         lpipss = []
 
+        # 逐个视角计算三大指标:PSNR, SSIM, LPIPS
         for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-            ssims.append(ssim(renders[idx], gts[idx]))
-            psnrs.append(psnr(renders[idx], gts[idx]))
-            lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
-
+            ssims.append(ssim(renders[idx], gts[idx]))                 # SSIM: 结构相似性,值域[0,1],越大越好
+            psnrs.append(psnr(renders[idx], gts[idx]))                 # PSNR: 峰值信噪比(dB),值域[0,+∞),越大越好
+            lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())   # LPIPS: 感知距离,值域[0,+∞),越小越好
+        
+        # 输出模型路径,所有视角的平均PSNR SSIM LPIPS 以及平均每帧可见的GS数量 
         logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
         logger.info("  PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
         logger.info("  SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims).mean(), ".5"))
@@ -636,6 +648,7 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
         logger.info("  GS_NUMS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(visible_count).float().mean(), ".5"))
         print("")
 
+        # 将评估的结果写入Wandb绘图
         if wandb is not None:
             wandb.log({"test_PSNR":torch.stack(psnrs).mean().item(), })
             wandb.log({"test_SSIM":torch.stack(ssims).mean().item(), })
@@ -648,6 +661,7 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
             tb_writer.add_scalar(f'{dataset_name}/LPIPS', torch.tensor(lpipss).mean().item(), 0)
             tb_writer.add_scalar(f'{dataset_name}/GS_NUMS', torch.tensor(visible_count).float().mean().item(), 0)
         
+        # 将测试集评估的结果保存到JSON文件中
         full_dict[scene_dir][method].update({
             "PSNR": torch.tensor(psnrs).mean().item(),
             "SSIM": torch.tensor(ssims).mean().item(),
@@ -655,13 +669,18 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
             "GS_NUMS": torch.tensor(visible_count).float().mean().item(),
             })
 
+        # 将每个视角的评估结果保存到JSON文件中
+        # eg:"PSNR":    {"00000.png": 28.1, "00001.png": 26.9, ...},  # 每张图各自的PSNR
+        #    "SSIM":    {"00000.png": 0.9, "00001.png": 0.85, ...}, # 每张图各自的SSIM
+        #    "LPIPS":   {"00000.png": 0.1, "00001.png": 0.15, ...}, # 每张图各自的LPIPS
+        #    "GS_NUMS": {"00000.png": 100, "00001.png": 120, ...} # 每张图各自的GS数量
         per_view_dict[scene_dir][method].update({
             "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
             "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
             "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-            "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(visible_count).tolist(), image_names)}
+            "GS_NUMS": {name:vc for vc, name in zip(torch.tensor(visible_count).tolist(), image_names)}
             })
-
+    # 最后将测试集结果保存在outputs/.../results.json(平均指标)和per_view.json(每个视角的指标)中
     with open(scene_dir + "/results.json", 'w') as fp:
         json.dump(full_dict[scene_dir], fp, indent=True)
     with open(scene_dir + "/per_view.json", 'w') as fp:
@@ -669,7 +688,7 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
     
 def get_logger(path):
     import logging
-
+    # 设置日志记录器
     logger = logging.getLogger()
     logger.setLevel(logging.INFO) 
     fileinfo = logging.FileHandler(os.path.join(path, "outputs.log"))
@@ -690,19 +709,19 @@ def get_logger(path):
 # ========================================================================
 if __name__ == "__main__":
     # ---------- 命令行参数 ----------
-    parser = ArgumentParser(description="Training script parameters")
+    parser = ArgumentParser(description="Training script parameters")         # YAML配置文件路径:config/scaffoldgs/base_model.yaml 或者lod_model.yaml
     parser.add_argument('--config', type=str, help='train config file path')  # 核心: YAML配置文件路径(如base_model.yaml或lod_model.yaml),决定了使用哪个模型
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument('--warmup', action='store_true', default=False)  # Warmup模式: 训练两轮, 第二轮用第一轮输出的点云进行重新初始化
-    parser.add_argument('--use_wandb', action='store_true', default=False)  # 是否使用wandb进行数据记录、绘制图表
+    parser.add_argument('--warmup', action='store_true', default=False)       # Warmup模式: 训练两轮, 第二轮用第一轮输出的点云进行重新初始化
+    parser.add_argument('--use_wandb', action='store_true', default=False)    # 是否使用wandb进行数据记录、绘制图表
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1])  # 在哪些迭代步数进行测试集评估,比如[10K,20K,30K,40K]显示PSNR SSIM指标
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1])  # 在哪些迭代步数保存.ply点云文件
     parser.add_argument("--quiet", action="store_true")  
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])  # 保存CheckPoint(完整模型状态的迭代步数)
-    parser.add_argument("--start_checkpoint", type=str, default = None)  # 从哪个CheckPoint文件恢复训练
+    parser.add_argument("--start_checkpoint", type=str, default = None)              # 从哪个CheckPoint文件恢复训练
     parser.add_argument("--gpu", type=str, default = '-1')
     args = parser.parse_args(sys.argv[1:])
     
@@ -724,7 +743,7 @@ if __name__ == "__main__":
 
     logger = get_logger(lp.model_path)
 
-    # 设置默认的测试/保存时机(每10000步一次)
+    # 设置默认的测试/保存时机(每10000步一次) test_iterations = [10000, 20000, 30000, 40000]
     if args.test_iterations[0] == -1:
         args.test_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
@@ -770,7 +789,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # ======================================================================
-    # 执行训练(Octree-AnyGS的核心训练函数)
+    #                           执行训练(Octree-AnyGS的核心训练函数)
     # ======================================================================
     training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
     
@@ -784,7 +803,8 @@ if __name__ == "__main__":
     logger.info("\nTraining complete.")
 
     # ======================================================================
-    # 渲染 + 评估
+    # 渲染 + 评估 若eval=True => 只渲染+评估测试集; 
+    #            若eval=False => 训练集渲染 + 评估(没有测试集)
     # ======================================================================
     logger.info(f'\nStarting Rendering~')
     if lp.eval:
@@ -795,5 +815,6 @@ if __name__ == "__main__":
 
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
+    # 读取Render的Image 以及 GT 计算PSNR/SSIM/LPIPS ==>将评估的结果保存到Result.json当中
     evaluate(lp.model_path, eval_name, visible_count=visible_count, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")
