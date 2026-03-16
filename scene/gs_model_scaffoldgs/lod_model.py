@@ -411,10 +411,11 @@ class GaussianLoDModel(BasicModel):
         dist_max = torch.quantile(all_dist, self.dist_ratio)
         dist_min = torch.quantile(all_dist, 1 - self.dist_ratio)
         self.standard_dist = dist_max               # d_max: LOD公式的归一化常数
-        if self.levels == -1:
+        if self.levels == -1 or self.levels == -2:
             # 自动计算LOD层数: K = round(log_fork(d_max/d_min)) + 1  与论文公式5)一致
             # 设置中self.fork=2 即标准八叉树(2³=8子节点),(每层体素边长 = 上层/fork)
-            self.levels = torch.round(torch.log2(dist_max/dist_min)/math.log2(self.fork)).int().item() + 1
+            extra_lod = getattr(self, 'extra_lod', 0)   # 命令行 --extra_lod N 控制额外层数
+            self.levels = torch.round(torch.log2(dist_max/dist_min)/math.log2(self.fork)).int().item() + 1 + extra_lod
         if self.init_level == -1:
             self.init_level = int(self.levels/2)     # 渐进训练初始层 = K/2 (最开始解锁L0-L(K/2-1)层的训练)
             

@@ -26,8 +26,8 @@ model_params: {
             # 八叉树结构参数 (针对BungeeNeRF多尺度场景优化)
             # ============================================================
             fork: 2,                    # 八叉树分支因子(标准八叉树)
-            base_layer: 11,             # 11层更精细的初始体素(voxel_size = box_d / 2^11)
-            levels: -1,                 # LOD总层数K, -1=自动计算
+            base_layer: 10,             # ★ 从11降为10, 减少每层Anchor数(体素更粗)
+            levels: -1,                 # LOD总层数K, -1=自动计算(可通过命令行--extra_lod N额外+N层)
             init_level: -1,             # 渐进训练初始激活层, -1=自动设为 K/2
             extend: 1.5,                # 场景包围盒扩展系数(BungeeNeRF跨尺度大, 需1.5)
             dist_ratio: 0.999,          # 取99.9%分位数作为d_max
@@ -39,7 +39,7 @@ model_params: {
                                         #   'round': 四舍五入硬切换(默认)
                                         #   'progressive': 平滑过渡(opacity插值)
             progressive: True,          # 启用从粗到精的渐进式训练
-            visible_threshold: 0.1,    # BungeeNeRF: 极低阈值(多尺度场景锚点可见频率低)
+            visible_threshold: 0.3,    # ★ 从0.1提高到0.3, 更激进地裁剪低频可见Anchor
                                         # (小场景=0.7, 大场景=0.01, 多尺度=0.2)
 
             use_feat_bank: False,       # 是否使用多分辨率特征库
@@ -69,19 +69,19 @@ pipeline_params: {
 
 # 优化参数 (针对BungeeNeRF多尺度场景 + Progressive模式优化)
 optim_params: {
-    iterations: 100_000,
+    iterations: 50_000,
 
     # --- 锚点位置学习率(lr=0, 不学习锚点位置) ---
     position_lr_init: 0.0,
     position_lr_final: 0.0,
     position_lr_delay_mult: 0.01,
-    position_lr_max_steps: 100_000,
+    position_lr_max_steps: 50_000,
     
     # --- 偏移量学习率 ---
     offset_lr_init: 0.01,
     offset_lr_final: 0.0001,
     offset_lr_delay_mult: 0.01,
-    offset_lr_max_steps: 100_000,
+    offset_lr_max_steps: 50_000,
 
     # --- 其他可学习参数 ---
     feature_lr: 0.0075,
@@ -92,27 +92,27 @@ optim_params: {
     mlp_opacity_lr_init: 0.002,
     mlp_opacity_lr_final: 0.00002,  
     mlp_opacity_lr_delay_mult: 0.01,
-    mlp_opacity_lr_max_steps: 100_000,
+    mlp_opacity_lr_max_steps: 50_000,
 
     mlp_cov_lr_init: 0.004,
     mlp_cov_lr_final: 0.004,
     mlp_cov_lr_delay_mult: 0.01,
-    mlp_cov_lr_max_steps: 100_000,
+    mlp_cov_lr_max_steps: 50_000,
     
     mlp_color_lr_init: 0.008,
     mlp_color_lr_final: 0.00005,
     mlp_color_lr_delay_mult: 0.01,
-    mlp_color_lr_max_steps: 100_000,
+    mlp_color_lr_max_steps: 50_000,
     
     mlp_featurebank_lr_init: 0.01,
     mlp_featurebank_lr_final: 0.00001,
     mlp_featurebank_lr_delay_mult: 0.01,
-    mlp_featurebank_lr_max_steps: 100_000,
+    mlp_featurebank_lr_max_steps: 50_000,
 
     appearance_lr_init: 0.05,
     appearance_lr_final: 0.0005,
     appearance_lr_delay_mult: 0.01,
-    appearance_lr_max_steps: 100_000,
+    appearance_lr_max_steps: 50_000,
 
     # --- 损失函数权重 ---
     lambda_dssim: 0.2,
@@ -129,18 +129,18 @@ optim_params: {
     start_stat: 500,
     update_from: 1500,
 
-    coarse_iter: 30000,                 # ★ 100K训练下渐进阶段延长到30K(前30%用于从粗到精解锁层级)
+    coarse_iter: 15000,                 # ★ 50K训练下渐进阶段15K(前30%用于从粗到精解锁层级)
     coarse_factor: 1.5,                 # 生长因子ω, 粗糙层分配更多步数
 
     update_interval: 100,
-    update_until: 60000,                # ★ 100K训练下致密化截止延长到60K(前60%允许增删锚点)
+    update_until: 25000,                # ★ 50K训练下致密化截止25K(前50%允许增删锚点, 更早停止生长)
     overlap: False,
     densification: True,
 
     # --- 剪枝/生长阈值 ---
-    min_opacity: 0.005,
+    min_opacity: 0.015,                 # ★ 从0.005提高到0.015, 更激进地剪枝低贡献Anchor
     success_threshold: 0.8,
-    densify_grad_threshold: 0.0002,
+    densify_grad_threshold: 0.0003,     # ★ 从0.0002提高到0.0003, 提高生长门槛
 
     # ============================================================
     # 跨层生长 & ΔL更新 (BungeeNeRF适配)

@@ -719,7 +719,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_wandb', action='store_true', default=False)    # 是否使用wandb进行数据记录、绘制图表
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1])  # 在哪些迭代步数进行测试集评估,比如[10K,20K,30K,40K]显示PSNR SSIM指标
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1])  # 在哪些迭代步数保存.ply点云文件
+    parser.add_argument("-m", "--model_path", type=str, default=None, help="自定义模型输出目录, 不指定则自动生成")
     parser.add_argument("--quiet", action="store_true")  
+    parser.add_argument("--extra_lod", type=int, default=0, help="自动计算LOD层数K后额外增加N层, 默认0")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])  # 保存CheckPoint(完整模型状态的迭代步数)
     parser.add_argument("--start_checkpoint", type=str, default = None)              # 从哪个CheckPoint文件恢复训练
     parser.add_argument("--gpu", type=str, default = '-1')
@@ -735,9 +737,16 @@ if __name__ == "__main__":
         lp, op, pp = parse_cfg(cfg)
         args.save_iterations.append(op.iterations)
 
+    # 将命令行的 --extra_lod 注入到模型配置中
+    if args.extra_lod != 0:
+        lp.model_config['kwargs']['extra_lod'] = args.extra_lod
+
     # 构建Output文件路径并备份config.yaml
-    cur_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    lp.model_path = os.path.join("outputs", lp.dataset_name, lp.scene_name, cur_time)
+    if args.model_path:
+        lp.model_path = args.model_path
+    else:
+        cur_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        lp.model_path = os.path.join("outputs", lp.dataset_name, lp.scene_name, cur_time)
     os.makedirs(lp.model_path, exist_ok=True)
     shutil.copy(args.config, os.path.join(lp.model_path, "config.yaml"))
 
