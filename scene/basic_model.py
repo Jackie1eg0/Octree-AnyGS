@@ -528,11 +528,14 @@ class BasicModel:
             # +1.0偏移: 使 L*=0 映射到 level=0 (而不是 level=-1)
             pred_level = torch.clamp(pred_level+1.0, min=0.9999, max=cur_level + 0.9999)
             int_level = torch.floor(pred_level).int()
-            # _prog_ratio: 小数部分, 在 generate_neural_gaussians() 中
-            # 作为临界层锚点不透明度的过渡系数, 实现层级边界的软过渡
-            self._prog_ratio = torch.frac(pred_level).unsqueeze(dim=1)  # [N, 1]
-            # transition_mask: 标记 "锚点层级 == 当前LOD等级" 的临界锚点
-            self.transition_mask = (self._level.squeeze(dim=1) == int_level)
+            # _prog_ratio 和 transition_mask 仅在 set_anchor_mask (全量锚点) 时需要,
+            # weed_out 调用时 pred_level 只覆盖候选子集, 尺寸与 self._level 不匹配, 跳过
+            if int_level.shape[0] == self._level.view(-1).shape[0]:
+                # _prog_ratio: 小数部分, 在 generate_neural_gaussians() 中
+                # 作为临界层锚点不透明度的过渡系数, 实现层级边界的软过渡
+                self._prog_ratio = torch.frac(pred_level).unsqueeze(dim=1)  # [N, 1]
+                # transition_mask: 标记 "锚点层级 == 当前LOD等级" 的临界锚点
+                self.transition_mask = (self._level.view(-1) == int_level)
         else:
             raise ValueError(f"Unknown dist2level: {self.dist2level}")
         

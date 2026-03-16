@@ -1,0 +1,151 @@
+# =============================================================================
+# Octree-GS LOD模型配置 — BungeeNeRF 多尺度大场景 + Progressive Alpha混合
+# 对应模型类: scene/gs_model_scaffoldgs/lod_model.py → GaussianLoDModel
+# 
+# 与默认 lod_model.yaml 的关键区别:
+#   1. dist2level: 'progressive'  → LOD层级边界alpha平滑过渡(替代硬切换)
+#   2. visible_threshold: 0.01    → 多尺度场景锚点可见频率极低,需降低阈值
+#   3. extend: 1.5                → 场景跨尺度大,包围盒需更大扩展
+#   4. base_layer: 11             → 11层更精细的初始体素
+#   5. coarse_iter: 15000         → 更长的渐进训练阶段(层级更多)
+#   6. extra_up: 0.01             → 更保守的ΔL更新步长
+# =============================================================================
+
+# 模型参数
+model_params: {
+    model_config: {
+        name: "GaussianLoDModel",
+        kwargs: {
+            feat_dim: 32,               # 锚点特征维度
+            view_dim: 3,                # 视角方向维度
+            appearance_dim: 0,          # 外观嵌入维度(0=关闭)
+            padding: 0.0,               # 体素网格填充偏移
+            n_offsets: 10,              # 每个锚点生成的高斯个数
+
+            # ============================================================
+            # 八叉树结构参数 (针对BungeeNeRF多尺度场景优化)
+            # ============================================================
+            fork: 2,                    # 八叉树分支因子(标准八叉树)
+            base_layer: 11,             # 11层更精细的初始体素(voxel_size = box_d / 2^11)
+            levels: -1,                 # LOD总层数K, -1=自动计算
+            init_level: -1,             # 渐进训练初始激活层, -1=自动设为 K/2
+            extend: 1.5,                # 场景包围盒扩展系数(BungeeNeRF跨尺度大, 需1.5)
+            dist_ratio: 0.999,          # 取99.9%分位数作为d_max
+
+            # ============================================================
+            # ★ Progressive Alpha混合: LOD层级边界平滑过渡
+            # ============================================================
+            dist2level: 'progressive',  # ★ 启用alpha混合(向下取整+小数部分做不透明度插值)
+                                        #   'round': 四舍五入硬切换(默认)
+                                        #   'progressive': 平滑过渡(opacity插值)
+            progressive: True,          # 启用从粗到精的渐进式训练
+            visible_threshold: 0.1,    # BungeeNeRF: 极低阈值(多尺度场景锚点可见频率低)
+                                        # (小场景=0.7, 大场景=0.01, 多尺度=0.2)
+
+            use_feat_bank: False,       # 是否使用多分辨率特征库
+        }
+    },
+    base_model: "scaffoldgs",
+    source_path: "./data/bungeenerf/amsterdam",     # ← 改为你的BungeeNeRF场景路径
+    dataset_name: "bungeenerf",
+    scene_name: "amsterdam_Progressive",            # ← 改为你的场景名
+    images: "images",
+    resolution: -1,
+    white_background: False,
+    random_background: False,
+    resolution_scales: [1.0],
+    data_device: "cuda",
+    eval: True,
+    ratio: 1,
+    render_mode: "RGB",
+}
+
+# Pipeline参数
+pipeline_params: {
+    compute_cov3D_python:  False,
+    debug:  False
+}
+
+
+# 优化参数 (针对BungeeNeRF多尺度场景 + Progressive模式优化)
+optim_params: {
+    iterations: 100_000,
+
+    # --- 锚点位置学习率(lr=0, 不学习锚点位置) ---
+    position_lr_init: 0.0,
+    position_lr_final: 0.0,
+    position_lr_delay_mult: 0.01,
+    position_lr_max_steps: 100_000,
+    
+    # --- 偏移量学习率 ---
+    offset_lr_init: 0.01,
+    offset_lr_final: 0.0001,
+    offset_lr_delay_mult: 0.01,
+    offset_lr_max_steps: 100_000,
+
+    # --- 其他可学习参数 ---
+    feature_lr: 0.0075,
+    scaling_lr: 0.007,
+    rotation_lr: 0.002,
+    
+    # --- MLP学习率 ---
+    mlp_opacity_lr_init: 0.002,
+    mlp_opacity_lr_final: 0.00002,  
+    mlp_opacity_lr_delay_mult: 0.01,
+    mlp_opacity_lr_max_steps: 100_000,
+
+    mlp_cov_lr_init: 0.004,
+    mlp_cov_lr_final: 0.004,
+    mlp_cov_lr_delay_mult: 0.01,
+    mlp_cov_lr_max_steps: 100_000,
+    
+    mlp_color_lr_init: 0.008,
+    mlp_color_lr_final: 0.00005,
+    mlp_color_lr_delay_mult: 0.01,
+    mlp_color_lr_max_steps: 100_000,
+    
+    mlp_featurebank_lr_init: 0.01,
+    mlp_featurebank_lr_final: 0.00001,
+    mlp_featurebank_lr_delay_mult: 0.01,
+    mlp_featurebank_lr_max_steps: 100_000,
+
+    appearance_lr_init: 0.05,
+    appearance_lr_final: 0.0005,
+    appearance_lr_delay_mult: 0.01,
+    appearance_lr_max_steps: 100_000,
+
+    # --- 损失函数权重 ---
+    lambda_dssim: 0.2,
+    lambda_dreg: 0.01,
+    
+    lambda_normal: 0.0,
+    normal_start_iter: 7_000,
+    lambda_dist: 0.0,
+    dist_start_iter: 3_000,
+
+    # ============================================================
+    # 致密化 & 渐进训练调度 (BungeeNeRF适配)
+    # ============================================================
+    start_stat: 500,
+    update_from: 1500,
+
+    coarse_iter: 30000,                 # ★ 100K训练下渐进阶段延长到30K(前30%用于从粗到精解锁层级)
+    coarse_factor: 1.5,                 # 生长因子ω, 粗糙层分配更多步数
+
+    update_interval: 100,
+    update_until: 60000,                # ★ 100K训练下致密化截止延长到60K(前60%允许增删锚点)
+    overlap: False,
+    densification: True,
+
+    # --- 剪枝/生长阈值 ---
+    min_opacity: 0.005,
+    success_threshold: 0.8,
+    densify_grad_threshold: 0.0002,
+
+    # ============================================================
+    # 跨层生长 & ΔL更新 (BungeeNeRF适配)
+    # ============================================================
+    update_ratio: 0.2,                  # β, 梯度阈值指数因子
+    extra_ratio: 0.25,                  # ΔL更新的梯度阈值比例
+    extra_up: 0.01,                     # ★ 从0.02降为0.01(更保守的ΔL更新, 防止跳层过快)
+}
