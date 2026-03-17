@@ -595,7 +595,7 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None, source_path=None, scene_name=None, base_layer=None):
     """对渲染结果计算质量指标: PSNR, SSIM, LPIPS, 以及平均可见高斯数。
     结果保存到 results.json 和 per_view.json。
     """
@@ -641,7 +641,9 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
             lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())   # LPIPS: 感知距离,值域[0,+∞),越小越好
         
         # 输出模型路径,所有视角的平均PSNR SSIM LPIPS 以及平均每帧可见的GS数量 
-        logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
+        logger.info(f"scene_name:  \033[1;35m{scene_name}\033[0m")
+        logger.info(f"source_path: \033[1;35m{source_path}\033[0m")
+        logger.info(f"model_path:  \033[1;35m{model_paths}\033[0m")
         logger.info("  PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
         logger.info("  SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims).mean(), ".5"))
         logger.info("  LPIPS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(lpipss).mean(), ".5"))
@@ -661,8 +663,12 @@ def evaluate(model_paths, eval_name, visible_count=None, wandb=None, tb_writer=N
             tb_writer.add_scalar(f'{dataset_name}/LPIPS', torch.tensor(lpipss).mean().item(), 0)
             tb_writer.add_scalar(f'{dataset_name}/GS_NUMS', torch.tensor(visible_count).float().mean().item(), 0)
         
-        # 将测试集评估的结果保存到JSON文件中
+        # 将测试集评估的结果保存到JSON文件中 (包含场景信息和路径)
         full_dict[scene_dir][method].update({
+            "scene_name": scene_name if scene_name else "",
+            "source_path": source_path if source_path else "",
+            "model_path": str(model_paths),
+            "base_layer": base_layer if base_layer is not None else "",
             "PSNR": torch.tensor(psnrs).mean().item(),
             "SSIM": torch.tensor(ssims).mean().item(),
             "LPIPS": torch.tensor(lpipss).mean().item(),
@@ -720,8 +726,10 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1])  # 在哪些迭代步数进行测试集评估,比如[10K,20K,30K,40K]显示PSNR SSIM指标
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1])  # 在哪些迭代步数保存.ply点云文件
     parser.add_argument("-m", "--model_path", type=str, default=None, help="自定义模型输出目录, 不指定则自动生成")
+    parser.add_argument("-s", "--source_path", type=str, default=None, help="数据集路径, 不指定则使用config中的source_path")
     parser.add_argument("--quiet", action="store_true")  
     parser.add_argument("--extra_lod", type=int, default=0, help="自动计算LOD层数K后额外增加N层, 默认0")
+    parser.add_argument("--base_layer", type=int, default=None, help="八叉树基础层号, 决定最粗体素大小, 不指定则使用config中的值")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])  # 保存CheckPoint(完整模型状态的迭代步数)
     parser.add_argument("--start_checkpoint", type=str, default = None)              # 从哪个CheckPoint文件恢复训练
     parser.add_argument("--gpu", type=str, default = '-1')
@@ -741,6 +749,14 @@ if __name__ == "__main__":
     if args.extra_lod != 0:
         lp.model_config['kwargs']['extra_lod'] = args.extra_lod
 
+    # 命令行 --base_layer 覆盖 config 中的 base_layer
+    if args.base_layer is not None:
+        lp.model_config['kwargs']['base_layer'] = args.base_layer
+
+    # 命令行 -s 覆盖 config 中的 source_path
+    if args.source_path:
+        lp.source_path = args.source_path
+
     # 构建Output文件路径并备份config.yaml
     if args.model_path:
         lp.model_path = args.model_path
@@ -748,7 +764,11 @@ if __name__ == "__main__":
         cur_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         lp.model_path = os.path.join("outputs", lp.dataset_name, lp.scene_name, cur_time)
     os.makedirs(lp.model_path, exist_ok=True)
-    shutil.copy(args.config, os.path.join(lp.model_path, "config.yaml"))
+    # 将实际使用的 source_path 和 model_path 写入保存的config.yaml
+    cfg['model_params']['source_path'] = lp.source_path
+    cfg['model_params']['model_path'] = lp.model_path
+    with open(os.path.join(lp.model_path, "config.yaml"), 'w', encoding='utf-8') as f_cfg:
+        yaml.dump(cfg, f_cfg, allow_unicode=True, default_flow_style=False)
 
     logger = get_logger(lp.model_path)
 
@@ -825,5 +845,5 @@ if __name__ == "__main__":
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
     # 读取Render的Image 以及 GT 计算PSNR/SSIM/LPIPS ==>将评估的结果保存到Result.json当中
-    evaluate(lp.model_path, eval_name, visible_count=visible_count, wandb=wandb, logger=logger)
+    evaluate(lp.model_path, eval_name, visible_count=visible_count, wandb=wandb, logger=logger, source_path=lp.source_path, scene_name=exp_name, base_layer=lp.model_config['kwargs'].get('base_layer'))
     logger.info("\nEvaluating complete.")
